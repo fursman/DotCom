@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Rubber Duckies Pool</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <style>
+    body { margin: 0; overflow: hidden; background: #000; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { Water } from 'three/addons/objects/Water.js';
+    import { Sky } from 'three/addons/objects/Sky.js';
+
+    // Scene
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0xb85020, 0.00018);
+
+    const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 20000);
+    camera.position.set(0, 30, 100);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 0.5;
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.maxPolarAngle = Math.PI * 0.495;
+    controls.target.set(0, 10, 0);
+    controls.minDistance = 40;
+    controls.maxDistance = 200;
+    controls.update();
+
+    // Sun state - animates slowly over time
+    const sun = new THREE.Vector3();
+    let sunTheta = Math.PI;
+    let renderTarget;
+    let lastPmremUpdate = -999;
+    let cloudMaterial; // declared early so updateSun can reference it
+
+    // Water
+    const waterGeometry = new THREE.PlaneGeometry(10000, 10000);
+    const water = new Water(waterGeometry, {
+      textureWidth: 1024,
+      textureHeight: 1024,
+      waterNormals: new THREE.TextureLoader().load(
+        'https://threejs.org/examples/textures/waternormals.jpg',
+        function(texture) {
+          texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+        }
+      ),
+      sunDirection: new THREE.Vector3(),
+      sunColor: 0xffffff,
+      waterColor: 0x001e0f,
+      distortionScale: 3.7,
+      fog: scene.fog !== undefined
+    });
+    water.rotation.x = -Math.PI / 2;
+    scene.add(water);
+
+    // Sky
+    const sky = new Sky();
+    sky.scale.setScalar(10000);
+    scene.add(sky);
+
+    const skyUniforms = sky.material.uniforms;
+    skyUniforms['turbidity'].value = 10;
+    skyUniforms['rayleigh'].value = 2;
+    skyUniforms['mieCoefficient'].value = 0.005;
+    skyUniforms['mieDirectionalG'].value = 0.8;
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+
+    function updateSun(rebuildPmrem) {
+      const phi = THREE.MathUtils.degToRad(90 - 0.5);
+      sun.setFromSphericalCoords(1, phi, sunTheta);
+      sky.material.uniforms['sunPosition'].value.copy(sun);
+      water.material.uniforms['sunDirection'].value.copy(sun).normalize();
+      if (cloudMaterial) cloudMaterial.uniforms.uSunPosition.value.copy(sun);
+      if (rebuildPmrem !== false) {
+        if (renderTarget !== undefined) renderTarget.dispose();
+        renderTarget = pmremGenerator.fromScene(sky);
+        scene.environment = renderTarget.texture;
+      }
+    }
+    updateSun();
+
+    // Volumetric Cloud Shader
+    const cloudVertexShader = `
+      varying vec3 vWorldPosition;
+      varying vec2 vUv;
+      void main() {
+        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPosition.xyz;
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    const cloudFragmentShader = `
+      uniform float uTime;
+      uniform vec3 uSunPosition;
+      uniform vec3 uSunColor;
+      uniform vec3 uCloudColor;
+      uniform vec3 uSkyColorTop;
+      uniform vec3 uSkyColorBottom;
+      uniform float uCloudCover;
+      uniform float uCloudSpeed;
+
+      varying vec3 vWorldPosition;
+      varying vec2 vUv;
+
+      // Simplex noise functions
+      vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+      vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+      float snoise(vec3 v) {
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+
+        vec3 i = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy;
+        vec3 x3 = x0 - D.yyy;
+
+        i = mod289(i);
+        vec4 p = permute(permute(permute(
+          i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+
+        float n_ = 0.142857142857;
+        vec3 ns = n_ * D.wyz - D.xzx;
+
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x;
+        p1 *= norm.y;
+        p2 *= norm.z;
+        p3 *= norm.w;
+
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+
+      // FBM (Fractal Brownian Motion) for layered cloud detail
+      float fbm(vec3 p) {
+        float value = 0.0;
+        float amplitude = 0.5;
+        float frequency = 1.0;
+        for (int i = 0; i < 6; i++) {
+          value += amplitude * snoise(p * frequency);
+          amplitude *= 0.5;
+          frequency *= 2.0;
+        }
+        return value;
+      }
+
+      // Cloud density function
+      float cloudDensity(vec3 p) {
+        vec3 wind = vec3(uTime * uCloudSpeed, 0.0, uTime * uCloudSpeed * 0.5);
+        float density = fbm(p * 0.0008 + wind * 0.1);
+        density += fbm(p * 0.002 + wind * 0.15) * 0.5;
+        density += fbm(p * 0.004 + wind * 0.2) * 0.25;
+
+        // Shape clouds more naturally
+        density = smoothstep(uCloudCover - 0.1, uCloudCover + 0.3, density);
+
+        // Fade at horizon
+        float height = normalize(vWorldPosition).y;
+        density *= smoothstep(0.0, 0.15, height);
+        density *= smoothstep(0.6, 0.3, height);
+
+        return max(0.0, density);
+      }
+
+      void main() {
+        vec3 viewDir = normalize(vWorldPosition);
+        float height = viewDir.y;
+
+        // Sky gradient
+        vec3 skyColor = mix(uSkyColorBottom, uSkyColorTop, smoothstep(-0.1, 0.5, height));
+
+        // Sun glow - softer for sunset
+        float sunDot = max(0.0, dot(viewDir, normalize(uSunPosition)));
+        vec3 sunGlow = uSunColor * pow(sunDot, 8.0) * 0.3;
+        sunGlow += uSunColor * pow(sunDot, 32.0) * 0.6;
+
+        // Cloud sampling
+        float cloud = cloudDensity(vWorldPosition);
+
+        // Cloud lighting - brighter facing sun
+        float cloudLight = 0.5 + 0.5 * dot(viewDir, normalize(uSunPosition));
+        vec3 litCloud = mix(uCloudColor * 0.6, uCloudColor * 1.2, cloudLight);
+
+        // Add golden rim lighting from sun
+        litCloud += uSunColor * pow(sunDot, 4.0) * cloud * 0.3;
+
+        // Composite - clouds over transparent background
+        vec3 color = litCloud;
+        float alpha = cloud * 0.95;
+
+        // Add sun glow to clouds
+        color += sunGlow * (1.0 - cloud * 0.5);
+
+        gl_FragColor = vec4(color, alpha);
+      }
+    `;
+
+    // Create cloud dome
+    const cloudGeometry = new THREE.SphereGeometry(5000, 64, 32, 0, Math.PI * 2, 0, Math.PI * 0.5);
+    cloudMaterial = new THREE.ShaderMaterial({
+      vertexShader: cloudVertexShader,
+      fragmentShader: cloudFragmentShader,
+      uniforms: {
+        uTime: { value: 0 },
+        uSunPosition: { value: sun.clone() },
+        uSunColor: { value: new THREE.Color(1.0, 0.5, 0.2) },
+        uCloudColor: { value: new THREE.Color(1.0, 0.85, 0.75) },
+        uSkyColorTop: { value: new THREE.Color(0.35, 0.25, 0.55) },
+        uSkyColorBottom: { value: new THREE.Color(1.0, 0.55, 0.35) },
+        uCloudCover: { value: 0.15 },
+        uCloudSpeed: { value: 0.04 }
+      },
+      side: THREE.BackSide,
+      depthWrite: false,
+      transparent: true,
+      blending: THREE.NormalBlending
+    });
+    // Sync sun now that cloudMaterial exists
+    cloudMaterial.uniforms.uSunPosition.value.copy(sun);
+    const cloudDome = new THREE.Mesh(cloudGeometry, cloudMaterial);
+    scene.add(cloudDome);
+
+    // Dot matrix email text - bottom right corner overlay
+    const dotCanvas = document.createElement('canvas');
+    dotCanvas.width = 700;
+    dotCanvas.height = 80;
+    const dotCtx = dotCanvas.getContext('2d');
+
+    // First render text to measure and sample
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = 700;
+    tempCanvas.height = 80;
+    const tempCtx = tempCanvas.getContext('2d');
+    tempCtx.fillStyle = 'white';
+    tempCtx.font = 'bold 42px monospace';
+    tempCtx.textAlign = 'right';
+    tempCtx.textBaseline = 'middle';
+    tempCtx.fillText('andrew@fursman.com', 692, 40);
+
+    // Sample and create dot matrix effect
+    const imageData = tempCtx.getImageData(0, 0, 700, 80);
+    const dotSize = 2;
+    const dotSpacing = 4;
+
+    dotCtx.fillStyle = 'white';
+    for (let y = 0; y < 80; y += dotSpacing) {
+      for (let x = 0; x < 700; x += dotSpacing) {
+        const i = (y * 700 + x) * 4;
+        if (imageData.data[i + 3] > 128) {
+          dotCtx.beginPath();
+          dotCtx.arc(x + dotSpacing/2, y + dotSpacing/2, dotSize, 0, Math.PI * 2);
+          dotCtx.fill();
+        }
+      }
+    }
+
+    // Create HTML overlay for bottom right
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;bottom:4px;right:8px;pointer-events:none;opacity:0.7;';
+    const img = document.createElement('img');
+    img.src = dotCanvas.toDataURL();
+    img.style.cssText = 'height:56px;';
+    overlay.appendChild(img);
+    document.body.appendChild(overlay);
+
+    // Create rubber duck
+    function createDuck() {
+      const duck = new THREE.Group();
+      // Glossy rubber material with slight metalness for IBL response
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0xFFDD00, roughness: 0.28, metalness: 0.05 });
+      const beakMat = new THREE.MeshStandardMaterial({ color: 0xFF6600, roughness: 0.3 });
+      const whiteMat = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
+      const pupilMat = new THREE.MeshStandardMaterial({ color: 0x000000 });
+      // Body - higher resolution for smooth silhouette
+      const body = new THREE.Mesh(new THREE.SphereGeometry(3, 32, 24), bodyMat);
+      body.scale.set(1, 0.8, 1.2);
+      duck.add(body);
+
+      // Head - higher resolution
+      const head = new THREE.Mesh(new THREE.SphereGeometry(2, 32, 24), bodyMat);
+      head.position.set(0, 2, 2.5);
+      duck.add(head);
+
+      // Wings - tall thin panels hugging the body's curvature
+      const wingGeo = new THREE.SphereGeometry(2.0, 16, 10);
+      const leftWing = new THREE.Mesh(wingGeo, bodyMat);
+      leftWing.scale.set(0.2, 0.52, 1.15);
+      leftWing.position.set(-2.75, 0.25, 0.0);
+      leftWing.rotation.z = 0.22;
+      leftWing.rotation.y = 0.08;
+      duck.add(leftWing);
+      const rightWing = new THREE.Mesh(wingGeo, bodyMat);
+      rightWing.scale.set(0.2, 0.52, 1.15);
+      rightWing.position.set(2.75, 0.25, 0.0);
+      rightWing.rotation.z = -0.22;
+      rightWing.rotation.y = -0.08;
+      duck.add(rightWing);
+
+      // Beak - flat wide duck bill
+      const beakTop = new THREE.Mesh(new THREE.SphereGeometry(0.9, 12, 8), beakMat);
+      beakTop.scale.set(1, 0.35, 1.3);
+      beakTop.position.set(0, 2.15, 4.4);
+      duck.add(beakTop);
+      const beakBottom = new THREE.Mesh(new THREE.SphereGeometry(0.75, 12, 8), beakMat);
+      beakBottom.scale.set(0.9, 0.25, 1.2);
+      beakBottom.position.set(0, 1.75, 4.3);
+      duck.add(beakBottom);
+
+      // Cute eyes - white sclera
+      const leftEyeWhite = new THREE.Mesh(new THREE.SphereGeometry(0.5, 12, 12), whiteMat);
+      leftEyeWhite.position.set(-0.85, 2.9, 3.8);
+      duck.add(leftEyeWhite);
+      const rightEyeWhite = new THREE.Mesh(new THREE.SphereGeometry(0.5, 12, 12), whiteMat);
+      rightEyeWhite.position.set(0.85, 2.9, 3.8);
+      duck.add(rightEyeWhite);
+
+      // Pupils
+      const leftPupil = new THREE.Mesh(new THREE.SphereGeometry(0.25, 8, 8), pupilMat);
+      leftPupil.position.set(-0.75, 2.95, 4.2);
+      duck.add(leftPupil);
+      const rightPupil = new THREE.Mesh(new THREE.SphereGeometry(0.25, 8, 8), pupilMat);
+      rightPupil.position.set(0.75, 2.95, 4.2);
+      duck.add(rightPupil);
+
+      // Eye shine/glint
+      const shineMat = new THREE.MeshStandardMaterial({ color: 0xFFFFFF, emissive: 0xFFFFFF, emissiveIntensity: 0.3 });
+      const leftShine = new THREE.Mesh(new THREE.SphereGeometry(0.1, 6, 6), shineMat);
+      leftShine.position.set(-0.65, 3.05, 4.3);
+      duck.add(leftShine);
+      const rightShine = new THREE.Mesh(new THREE.SphereGeometry(0.1, 6, 6), shineMat);
+      rightShine.position.set(0.85, 3.05, 4.3);
+      duck.add(rightShine);
+
+      // Tail
+      const tail = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 8), bodyMat);
+      tail.rotation.x = -Math.PI / 4;
+      tail.position.set(0, 1, -3.2);
+      duck.add(tail);
+
+      return duck;
+    }
+
+    // Create ducks - 30 for a fuller pool
+    const ducks = [];
+    for (let i = 0; i < 30; i++) {
+      const duck = createDuck();
+      const scale = 1 + Math.random() * 0.5;
+      duck.scale.setScalar(scale);
+      duck.position.x = (Math.random() - 0.5) * 150;
+      duck.position.z = (Math.random() - 0.5) * 150;
+      duck.position.y = 1;
+      duck.rotation.y = Math.random() * Math.PI * 2;
+
+      duck.userData = {
+        floatSpeed: 0.3 + Math.random() * 0.3,
+        floatOffset: Math.random() * Math.PI * 2,
+        floatAmplitude: 0.5 + Math.random() * 0.4, // each duck bobs differently
+        driftX: (Math.random() - 0.5) * 0.05,
+        driftZ: (Math.random() - 0.5) * 0.05,
+        rotateSpeed: (Math.random() - 0.5) * 0.005
+      };
+
+      scene.add(duck);
+      ducks.push(duck);
+    }
+
+    // Auto-pan for kiosk (no mouse/touch detected)
+    let hasInteracted = false;
+    window._hasInteracted = false;
+    let autoPanAngle = Math.PI * 0.5;
+    const autoPanSpeed = 0.000133;
+    const autoPanRadius = 100;
+
+    setTimeout(() => {
+      ['mousemove','mousedown','touchstart','wheel'].forEach(evt => {
+        renderer.domElement.addEventListener(evt, () => {
+          hasInteracted = true;
+          window._hasInteracted = true;
+        }, { once: true });
+      });
+    }, 2000);
+
+    // Animation
+    function animate() {
+      requestAnimationFrame(animate);
+      const t = performance.now() * 0.001;
+
+      water.material.uniforms['time'].value += 1.0 / 60.0;
+      cloudMaterial.uniforms.uTime.value = t;
+
+      // Slowly animate sun azimuth - full rotation takes ~50 minutes
+      sunTheta += 0.000035;
+      sun.setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - 0.5), sunTheta);
+      sky.material.uniforms['sunPosition'].value.copy(sun);
+      water.material.uniforms['sunDirection'].value.copy(sun).normalize();
+      cloudMaterial.uniforms.uSunPosition.value.copy(sun);
+
+      // Throttle expensive PMREM rebuild to every 5 seconds
+      if (t - lastPmremUpdate > 5.0) {
+        lastPmremUpdate = t;
+        if (renderTarget !== undefined) renderTarget.dispose();
+        renderTarget = pmremGenerator.fromScene(sky);
+        scene.environment = renderTarget.texture;
+      }
+
+      // Animate ducks
+      for (let i = 0; i < ducks.length; i++) {
+        const duck = ducks[i];
+        const d = duck.userData;
+        duck.position.y = 1 + Math.sin(t * d.floatSpeed + d.floatOffset) * d.floatAmplitude;
+        duck.position.x += d.driftX;
+        duck.position.z += d.driftZ;
+        if (Math.abs(duck.position.x) > 80) d.driftX *= -1;
+        if (Math.abs(duck.position.z) > 80) d.driftZ *= -1;
+        duck.rotation.y += d.rotateSpeed;
+        // More expressive wave-riding pitch and roll
+        duck.rotation.x = Math.sin(t * d.floatSpeed + d.floatOffset) * 0.04;
+        duck.rotation.z = Math.cos(t * d.floatSpeed + d.floatOffset * 0.7) * 0.04;
+
+        for (let j = i + 1; j < ducks.length; j++) {
+          const other = ducks[j];
+          const dx = duck.position.x - other.position.x;
+          const dz = duck.position.z - other.position.z;
+          const distSq = dx * dx + dz * dz;
+          const minDist = 2.8 * duck.scale.x + 2.8 * other.scale.x;
+
+          if (distSq < minDist * minDist && distSq > 0.0001) {
+            const dist = Math.sqrt(distSq);
+            const overlap = minDist - dist;
+            const force = overlap * 0.02;
+
+            d.driftX += (dx / dist) * force;
+            d.driftZ += (dz / dist) * force;
+            other.userData.driftX -= (dx / dist) * force;
+            other.userData.driftZ -= (dz / dist) * force;
+
+            const limit = 0.15;
+            d.driftX = Math.max(-limit, Math.min(limit, d.driftX));
+            d.driftZ = Math.max(-limit, Math.min(limit, d.driftZ));
+            other.userData.driftX = Math.max(-limit, Math.min(limit, other.userData.driftX));
+            other.userData.driftZ = Math.max(-limit, Math.min(limit, other.userData.driftZ));
+          }
+        }
+      }
+
+      // Auto-pan when no mouse detected (kiosk mode)
+      if (!hasInteracted) {
+        autoPanAngle += autoPanSpeed;
+        camera.position.x = Math.cos(autoPanAngle) * autoPanRadius;
+        camera.position.z = Math.sin(autoPanAngle) * autoPanRadius;
+        camera.position.y = 25 + Math.sin(autoPanAngle * 0.3) * 8;
+        controls.target.set(0, 10, 0);
+      }
+
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+
+
+</body>
+</html>
