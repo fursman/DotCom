@@ -78,8 +78,20 @@
     //  Physical atmosphere (shared constants between JS and GLSL)
     //  Units: kilometres. Single scattering Rayleigh + Mie + ozone.
     // ------------------------------------------------------------------
-    // golden hour on a clear blue day; ?sun=0.5 gives the original's horizon-grazing sunset
-    const SUN_ELEV = THREE.MathUtils.degToRad(params.has('sun') ? parseFloat(params.get('sun')) : 5.5);
+    // The sun slowly sets and rises in a loop: golden hour on a clear blue day, down through
+    // sunset into dusk, then back up. ?sun=<deg> pins it (0.5 = the original's horizon sunset),
+    // ?cycle=<seconds> changes the loop length.
+    const deg = THREE.MathUtils.degToRad;
+    const SUN_FIXED = params.has('sun');
+    const SUN_HIGH = 9.0, SUN_LOW = -4.5, SUN_START = 5.5;
+    const SUN_CYCLE = params.has('cycle') ? Math.max(10, parseFloat(params.get('cycle'))) : 480;
+    const SUN_PHASE0 = Math.acos((SUN_START - (SUN_HIGH + SUN_LOW) / 2) / ((SUN_HIGH - SUN_LOW) / 2)); // starts at 5.5 deg, setting
+    function sunElevation(t) {
+      if (SUN_FIXED) return deg(parseFloat(params.get('sun')));
+      const mid = (SUN_HIGH + SUN_LOW) / 2, amp = (SUN_HIGH - SUN_LOW) / 2;
+      return deg(mid + amp * Math.cos(SUN_PHASE0 + 2 * Math.PI * t / SUN_CYCLE));
+    }
+    let SUN_ELEV = sunElevation(0);
     const SUN_E = 20.0;                               // solar irradiance (arbitrary HDR units)
     const MIE = 0.9;                                  // clean maritime air
     const OZONE = 2.0;
@@ -175,7 +187,12 @@
         const s = (i + 0.5) * ds; const q = [p[0] + L[0] * s, p[1] + L[1] * s, p[2] + L[2] * s];
         const e = jExt(Math.hypot(q[0], q[1], q[2]) - A.PR); od[0] += e[0] * ds; od[1] += e[1] * ds; od[2] += e[2] * ds;
       }
-      return od.map(v => Math.exp(-v));
+      // soft planet shadow (matches the GLSL), so nothing is lit through the Earth after sunset
+      const h = Math.hypot(p[0], p[1], p[2]);
+      const horizonCos = -Math.sqrt(Math.max(0, 1 - (A.PR * A.PR) / (h * h)));
+      const mu = (p[0] * L[0] + p[1] * L[1] + p[2] * L[2]) / h;
+      const sh = THREE.MathUtils.smoothstep(mu, horizonCos - 0.01, horizonCos + 0.005);
+      return od.map(v => Math.exp(-v) * sh);
     }
     function jSky(rd, L) {
       const ro = [0, A.PR + 0.01, 0]; const tmax = jRaySphere(ro, rd, A.AR)[1];
@@ -1289,6 +1306,7 @@
     }
     // BASE_EV was tuned for the 0.5 degree sunset; other sun heights are metered relative to it
     const REF_KEY = meterKey([0, Math.sin(THREE.MathUtils.degToRad(0.5)), -Math.cos(THREE.MathUtils.degToRad(0.5))]);
+    let targetExposure = BASE_EV;
     function updateLighting() {
       const L = [sunDir.x, sunDir.y, sunDir.z];
       const tg = jSunT([0, A.PR + 0.01, 0], L);
@@ -1309,7 +1327,7 @@
       skyCubeMat.uniforms.uAmb.value.copy(amb);
       waterMat.uniforms.uSunE.value.copy(sunE);
       waterMat.uniforms.uAmb.value.copy(amb);
-      const lum = Math.max(sunE.x, sunE.y, sunE.z);
+      const lum = Math.max(sunE.x, sunE.y, sunE.z, 1e-6);
       sunLight.color.setRGB(sunE.x / lum, sunE.y / lum, sunE.z / lum, THREE.LinearSRGBColorSpace);
       sunLight.intensity = lum;
       const omega = 2 * Math.PI * (1 - Math.cos(SUN_ANG));
@@ -1318,7 +1336,8 @@
       compMat.uniforms.uSunCol.value.copy(sunE);
       // auto exposure: meter on direct sun + sky light, like a camera in program mode
       const key = luma(sunE) * 0.25 + luma(amb);
-      dofMat.uniforms.uExposure.value = BASE_EV * Math.pow(REF_KEY / Math.max(key, 1e-4), 0.48);
+      // (the gain is capped so dusk reads as dusk instead of being pumped back to daylight)
+      targetExposure = BASE_EV * THREE.MathUtils.clamp(Math.pow(REF_KEY / Math.max(key, 1e-5), 0.48), 0.2, 2.2);
     }
     function setSun() {
       sunDir.setFromSphericalCoords(1, Math.PI / 2 - SUN_ELEV, sunTheta);
@@ -1326,6 +1345,7 @@
     }
     setSun();
     updateLighting();
+    dofMat.uniforms.uExposure.value = targetExposure;
 
     // prime the cubemap + environment
     for (let i = 0; i < 6; i++) renderCubeFace(i);
@@ -1402,10 +1422,16 @@
       simTime += dt;
       const t = simTime;
 
-      // sun drifts exactly like the original (per-frame rate converted to seconds)
+      // sun drifts sideways exactly like the original (per-frame rate converted to seconds),
+      // and now also slowly sets and rises
       sunTheta += 0.000035 * 60 * dt;
+      SUN_ELEV = sunElevation(t);
       setSun();
       if (t - lastLight > 0.5) { updateLighting(); lastLight = t; }
+      { // eye-like exposure adaptation
+        const u = dofMat.uniforms.uExposure;
+        u.value += (targetExposure - u.value) * (CAPTURE ? 1 : 1 - Math.exp(-dt * 1.5));
+      }
 
       updateDucks(t, dt);
 
