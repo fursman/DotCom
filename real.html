@@ -31,7 +31,6 @@
   <script type="module">
     import * as THREE from 'three';
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
     import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
     // ------------------------------------------------------------------
@@ -79,9 +78,10 @@
     //  Physical atmosphere (shared constants between JS and GLSL)
     //  Units: kilometres. Single scattering Rayleigh + Mie + ozone.
     // ------------------------------------------------------------------
-    const SUN_ELEV = THREE.MathUtils.degToRad(params.has('sun') ? parseFloat(params.get('sun')) : 0.5);   // same as the original page
+    // golden hour on a clear blue day; ?sun=0.5 gives the original's horizon-grazing sunset
+    const SUN_ELEV = THREE.MathUtils.degToRad(params.has('sun') ? parseFloat(params.get('sun')) : 5.5);
     const SUN_E = 20.0;                               // solar irradiance (arbitrary HDR units)
-    const MIE = 1.3;                                  // light golden-hour aerosol load
+    const MIE = 0.9;                                  // clean maritime air
     const OZONE = 2.0;
     let sunTheta = Math.PI;
     const sunDir = new THREE.Vector3();
@@ -153,7 +153,7 @@
         }
         vec3 single = SUN_E * (sumR * BR * pr + sumM * (BMS * MIE) * pm);
         // cheap multiple-scattering lift (keeps the zenith from going grey/black at sunset)
-        vec3 ms = SUN_E * (sumR * BR + sumM * (BMS * MIE)) * (1.0 / (4.0 * PI)) * 0.3;
+        vec3 ms = SUN_E * (sumR * BR + sumM * (BMS * MIE)) * (1.0 / (4.0 * PI)) * 0.45;
         return single + ms;
       }
     `;
@@ -190,7 +190,7 @@
         const dr = Math.exp(-h / A.HR), dm = Math.exp(-h / A.HM); const Ts = jSunT(p, L);
         for (let c = 0; c < 3; c++) { od[c] += 0.5 * e[c] * ds; const T = Math.exp(-od[c]) * Ts[c]; od[c] += 0.5 * e[c] * ds; sR[c] += T * dr * ds; sM[c] += T * dm * ds; }
       }
-      return [0, 1, 2].map(c => SUN_E * (sR[c] * A.BR[c] * pr + sM[c] * A.BMS * MIE * pm) + SUN_E * (sR[c] * A.BR[c] + sM[c] * A.BMS * MIE) / (4 * Math.PI) * 0.3);
+      return [0, 1, 2].map(c => SUN_E * (sR[c] * A.BR[c] * pr + sM[c] * A.BMS * MIE * pm) + SUN_E * (sR[c] * A.BR[c] + sM[c] * A.BMS * MIE) / (4 * Math.PI) * 0.45);
     }
 
     // ------------------------------------------------------------------
@@ -284,7 +284,7 @@
         uNoise: { value: noiseRT.texture },
         uSunCloud: { value: new THREE.Vector3() },
         uAmb: { value: new THREE.Vector3() },
-        uCoverage: { value: params.has('cov') ? parseFloat(params.get('cov')) : 0.3 },
+        uCoverage: { value: params.has('cov') ? parseFloat(params.get('cov')) : 0.2 },
         uSunHigh: { value: new THREE.Vector3() },
         uWind: { value: new THREE.Vector2(0.010, 0.004) },
         uWaterTint: { value: new THREE.Vector3(0.002, 0.008, 0.008) }
@@ -300,9 +300,9 @@
         uniform sampler3D uNoise;
         ${ATMO_GLSL}
 
-        const float CB = 1.25;  // cloud base (km)
-        const float CT = 3.1;   // cloud top (km)
-        const float SIGMA = 28.0;
+        const float CB = 1.5;   // cloud base (km)
+        const float CT = 4.2;   // cloud top (km) - tall, towering fair-weather cumulus
+        const float SIGMA = 24.0;
 
         float remap(float x, float a, float b, float c, float d) { return c + (x - a) / (b - a) * (d - c); }
         float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
@@ -314,19 +314,20 @@
           q.xz += uWind * uTime;
           float weather = texture(uNoise, vec3(q.xz * 0.011, 0.37)).r;
           float weather2 = texture(uNoise, vec3(q.xz * 0.004 + 0.3, 0.71)).g;
-          float cov = clamp(uCoverage + (weather - 0.55) * 0.9 + (weather2 - 0.5) * 0.5, 0.0, 1.0);
-          vec4 n = texture(uNoise, q * vec3(0.075, 0.11, 0.075));
+          float cov = clamp(uCoverage + (weather - 0.55) * 0.55 + (weather2 - 0.5) * 0.35, 0.0, 1.0);
+          vec4 n = texture(uNoise, q * vec3(0.052, 0.07, 0.052));
           float wf = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
           float base = remap(n.r, wf - 1.0, 1.0, 0.0, 1.0);
-          float prof = smoothstep(0.0, 0.08, h) * smoothstep(1.0, 0.35, h);
-          // flatter, darker bases with puffy tops
-          base *= prof;
-          base = clamp(remap(base, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+          // flat bases, rounded cauliflower tops: coverage shrinks with height
+          float prof = smoothstep(0.0, 0.05, h) * smoothstep(1.0, 0.7, h);
+          float c = cov * mix(1.0, 0.55, h * h);
+          base = clamp(remap(base * prof, 1.0 - c, 1.0, 0.0, 1.0), 0.0, 1.0);
+          base *= mix(0.55, 1.25, h);
           if (detail && base > 0.0) {
-            vec4 d = texture(uNoise, q * 0.42 + vec3(0.0, uTime * 0.003, 0.0));
+            vec4 d = texture(uNoise, q * 0.38 + vec3(0.0, uTime * 0.004, 0.0));
             float df = d.g * 0.625 + d.b * 0.25 + d.a * 0.125;
-            df = mix(df, 1.0 - df, clamp(h * 3.0, 0.0, 1.0));
-            base = clamp(remap(base, df * 0.38, 1.0, 0.0, 1.0), 0.0, 1.0);
+            df = mix(1.0 - df, df, clamp(h * 2.5, 0.0, 1.0));  // wispy bases, billowy tops
+            base = clamp(remap(base, df * 0.42, 1.0, 0.0, 1.0), 0.0, 1.0);
           }
           return base;
         }
@@ -340,7 +341,7 @@
             od += cloudDensity(pos, i < 2) * ds;
             ds *= 1.8;
           }
-          return od * SIGMA * 0.5;
+          return od * SIGMA * 0.4;
         }
 
         float dualPhase(float mu, float scale) {
@@ -355,7 +356,7 @@
           float t0 = raySphere(ro, rd, PR + CB).y;
           float t1 = raySphere(ro, rd, PR + CT).y;
           if (t0 > 160.0) return vec4(0.0, 0.0, 0.0, 1.0);
-          t1 = min(t1, t0 + 22.0);
+          t1 = min(t1, t0 + 26.0);
           const int N = ${isMobile ? 36 : 56};
           float dt = (t1 - t0) / float(N);
           float t = t0 + dt * hash12(gl_FragCoord.xy);
@@ -417,7 +418,7 @@
             vec2 st = mat2(0.8, -0.6, 0.6, 0.8) * (uv * vec2(0.018, 0.036)) + warp * 0.3;
             float c = texture(uNoise, vec3(st, 0.45)).r * 0.65 + texture(uNoise, vec3(st * 3.1, 0.8)).g * 0.35;
             float m = texture(uNoise, vec3(uv * 0.0035, 0.9)).g;
-            float den = smoothstep(0.58, 0.9, c) * smoothstep(0.45, 0.75, m) * 0.8;
+            float den = smoothstep(0.6, 0.92, c) * smoothstep(0.5, 0.8, m) * 0.45;
             den *= smoothstep(0.0, 0.04, rd.y) * smoothstep(420.0, 150.0, tc);
             float mu = dot(rd, uSun);
             vec3 lum = uSunHigh * (phaseHG(mu, 0.6) * 0.7 + 0.3 / (4.0 * PI)) * PI * 1.3 + uAmb * 1.2;
@@ -784,6 +785,85 @@
     scene.add(sunLight, sunLight.target);
 
     // ------------------------------------------------------------------
+    //  Round, energy-conserving bloom: 13-tap downsample + tent upsample
+    //  mip chain (no separable kernels, so bright suns stay circular)
+    // ------------------------------------------------------------------
+    class Bloom {
+      constructor() {
+        this.mips = [];
+        const vs = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+        this.down = new THREE.ShaderMaterial({
+          uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uFirst: { value: 0 } },
+          vertexShader: vs,
+          fragmentShader: /* glsl */`
+            varying vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uFirst;
+            vec3 tap(vec2 o) {
+              vec3 c = texture(tSrc, vUv + o * uTexel).rgb;
+              // soft-limit extreme HDR spikes (the sun) so the glow stays smooth and round
+              float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+              return uFirst > 0.5 ? c * (1.0 / (1.0 + l / 400.0)) : c;
+            }
+            void main() {
+              vec3 a = tap(vec2(-2, 2)), b = tap(vec2(0, 2)), c = tap(vec2(2, 2));
+              vec3 d = tap(vec2(-2, 0)), e = tap(vec2(0, 0)), f = tap(vec2(2, 0));
+              vec3 g = tap(vec2(-2, -2)), h = tap(vec2(0, -2)), i = tap(vec2(2, -2));
+              vec3 j = tap(vec2(-1, 1)), k = tap(vec2(1, 1)), l = tap(vec2(-1, -1)), m = tap(vec2(1, -1));
+              vec3 o = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+              gl_FragColor = vec4(o, 1.0);
+            }`
+        });
+        this.up = new THREE.ShaderMaterial({
+          uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uRadius: { value: 1.0 } },
+          vertexShader: vs,
+          blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, transparent: true,
+          fragmentShader: /* glsl */`
+            varying vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uRadius;
+            void main() {
+              vec2 t = uTexel * uRadius;
+              vec3 s = texture(tSrc, vUv).rgb * 4.0;
+              s += (texture(tSrc, vUv + vec2(-t.x, 0.0)).rgb + texture(tSrc, vUv + vec2(t.x, 0.0)).rgb +
+                    texture(tSrc, vUv + vec2(0.0, -t.y)).rgb + texture(tSrc, vUv + vec2(0.0, t.y)).rgb) * 2.0;
+              s += texture(tSrc, vUv + vec2(-t.x, -t.y)).rgb + texture(tSrc, vUv + vec2(t.x, -t.y)).rgb +
+                   texture(tSrc, vUv + vec2(-t.x, t.y)).rgb + texture(tSrc, vUv + vec2(t.x, t.y)).rgb;
+              gl_FragColor = vec4(s / 16.0, 1.0);
+            }`
+        });
+        this.quad = new FullScreenQuad(null);
+      }
+      setSize(w, h) {
+        this.mips.forEach(m => m.dispose());
+        this.mips = [];
+        let cw = Math.max(1, w >> 1), ch = Math.max(1, h >> 1);
+        for (let i = 0; i < 7 && cw >= 4 && ch >= 4; i++) {
+          this.mips.push(mkRT(cw, ch));
+          cw = Math.max(1, cw >> 1); ch = Math.max(1, ch >> 1);
+        }
+      }
+      render(renderer, src, srcW, srcH) {
+        const ac = renderer.autoClear;
+        let input = src, iw = srcW, ih = srcH;
+        this.quad.material = this.down;
+        this.mips.forEach((m, i) => {
+          this.down.uniforms.tSrc.value = input;
+          this.down.uniforms.uTexel.value.set(1 / iw, 1 / ih);
+          this.down.uniforms.uFirst.value = i === 0 ? 1 : 0;
+          renderer.setRenderTarget(m); this.quad.render(renderer);
+          input = m.texture; iw = m.width; ih = m.height;
+        });
+        renderer.autoClear = false;
+        this.quad.material = this.up;
+        for (let i = this.mips.length - 1; i > 0; i--) {
+          const s = this.mips[i];
+          this.up.uniforms.tSrc.value = s.texture;
+          this.up.uniforms.uTexel.value.set(1 / s.width, 1 / s.height);
+          renderer.setRenderTarget(this.mips[i - 1]); this.quad.render(renderer);
+        }
+        renderer.autoClear = ac;
+        return this.mips[0].texture;
+      }
+    }
+
+    // ------------------------------------------------------------------
     //  Render targets
     // ------------------------------------------------------------------
     const size = new THREE.Vector2();
@@ -798,8 +878,8 @@
       reflRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
       refrRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { depthTexture: new THREE.DepthTexture(Math.ceil(w / 2), Math.ceil(h / 2), THREE.FloatType) });
       dofRT = mkRT(w, h);
-      if (!bloom) bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.32, 0.6, 1.1);
-      else bloom.setSize(w, h);
+      if (!bloom) bloom = new Bloom();
+      bloom.setSize(w, h);
     }
     allocTargets();
 
@@ -1083,14 +1163,18 @@
 
     const compMat = new THREE.ShaderMaterial({
       uniforms: {
-        tColor: { value: null }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2() },
+        tColor: { value: null }, tBloom: { value: null }, tDepth: { value: null }, uBloom: { value: 0.05 },
+        uSky: { value: cubeRT.texture }, uSunDir: { value: sunDir },
+        uTime: { value: 0 }, uRes: { value: new THREE.Vector2() },
         uSunUV: { value: new THREE.Vector2() }, uSunVis: { value: 0 }, uSunCol: { value: new THREE.Vector3() }
       },
       vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
       fragmentShader: /* glsl */`
         varying vec2 vUv;
-        uniform sampler2D tColor;
-        uniform float uTime, uSunVis;
+        uniform sampler2D tColor, tBloom, tDepth;
+        uniform samplerCube uSky;
+        uniform vec3 uSunDir;
+        uniform float uTime, uSunVis, uBloom;
         uniform vec2 uRes, uSunUV;
         uniform vec3 uSunCol;
         float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
@@ -1107,8 +1191,30 @@
           col.g = texture(tColor, 0.5 + duv).g;
           col.b = texture(tColor, 0.5 + duv + ca).b;
 
-          // lens ghosts from the sun
+          // round bloom (energy conserving mix; the mip chain sums 7 levels)
+          vec3 bl = texture(tBloom, 0.5 + duv).rgb / 7.0;
+          col = mix(col, bl, uBloom);
+
+          // how much of the sun is actually visible: cloud transmittance x unoccluded by ducks
+          float vis = 0.0;
           if (uSunVis > 0.001) {
+            float clear = 0.0;
+            for (int i = 0; i < 5; i++) {
+              vec2 o = vec2(float(i - 2) * 0.004, float((i * 3) % 5 - 2) * 0.004);
+              clear += step(0.99999, texture(tDepth, uSunUV + o).x);
+            }
+            vis = uSunVis * (clear / 5.0) * texture(uSky, uSunDir).a;
+          }
+
+          // circular sun glare (veiling glare of the lens), aspect-correct
+          if (vis > 0.001) {
+            float r = length((uv - uSunUV) * vec2(aspect, 1.0));
+            float glare = 0.03 * exp(-r * 55.0) + 0.006 * exp(-r * 14.0) + 0.0012 * exp(-r * 4.0);
+            col += uSunCol * vis * glare * 20.0;
+          }
+
+          // lens ghosts from the sun
+          if (vis > 0.001) {
             vec2 axis = vec2(0.5) - uSunUV;
             vec3 g = vec3(0.0);
             float k[6] = float[6](0.35, 0.62, 0.9, 1.25, 1.55, 1.85);
@@ -1121,8 +1227,11 @@
             }
             float hd = length((uv - (uSunUV + axis * 2.0)) * vec2(aspect, 1.0));
             g += vec3(0.6, 0.7, 1.0) * smoothstep(0.02, 0.0, abs(hd - 0.32)) * 0.25;
-            col += g * uSunCol * uSunVis * 0.004;
+            col += g * uSunCol * vis * 0.004;
           }
+
+          // camera white balance (auto-WB pulls golden hour slightly toward neutral)
+          col *= vec3(0.93, 0.99, 1.10);
 
           // vignette (natural cos^4-ish falloff)
           float vig = pow(clamp(1.0 - r2 * 0.32, 0.0, 1.0), 2.0);
@@ -1166,7 +1275,20 @@
     // ------------------------------------------------------------------
     const sunE = new THREE.Vector3(), sunCloud = new THREE.Vector3(), amb = new THREE.Vector3();
     const BASE_EV = params.has('ev') ? parseFloat(params.get('ev')) : 0.72;
-    const REF_SUN_LUM = SUN_E * jSunT([0, A.PR + 0.01, 0], [0, Math.sin(THREE.MathUtils.degToRad(0.5)), -Math.cos(THREE.MathUtils.degToRad(0.5))])[0];
+    const luma = (v) => 0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z;
+    // metering key: direct sun + average sky radiance
+    function meterKey(L) {
+      const t = jSunT([0, A.PR + 0.01, 0], L);
+      let k = (0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]) * SUN_E * 0.25;
+      for (const el of [0.08, 0.35, 0.8]) for (let a = 0; a < 6; a++) {
+        const az = a / 6 * Math.PI * 2, ce = Math.cos(el);
+        const sk = jSky([Math.cos(az) * ce, Math.sin(el), Math.sin(az) * ce], L);
+        k += (0.2126 * sk[0] + 0.7152 * sk[1] + 0.0722 * sk[2]) / 18;
+      }
+      return k;
+    }
+    // BASE_EV was tuned for the 0.5 degree sunset; other sun heights are metered relative to it
+    const REF_KEY = meterKey([0, Math.sin(THREE.MathUtils.degToRad(0.5)), -Math.cos(THREE.MathUtils.degToRad(0.5))]);
     function updateLighting() {
       const L = [sunDir.x, sunDir.y, sunDir.z];
       const tg = jSunT([0, A.PR + 0.01, 0], L);
@@ -1194,8 +1316,9 @@
       skyDomeMat.uniforms.uSunDisk.value.copy(sunE).multiplyScalar(1 / omega).clampScalar(0, 40000);
       if (vinyl.userData.shader) vinyl.userData.shader.uniforms.uSunColV.value.copy(sunE);
       compMat.uniforms.uSunCol.value.copy(sunE);
-      // exposure compensation if the sun is moved off its default height (?sun=)
-      dofMat.uniforms.uExposure.value = BASE_EV * Math.pow(REF_SUN_LUM / Math.max(lum, 1e-3), 0.75);
+      // auto exposure: meter on direct sun + sky light, like a camera in program mode
+      const key = luma(sunE) * 0.25 + luma(amb);
+      dofMat.uniforms.uExposure.value = BASE_EV * Math.pow(REF_KEY / Math.max(key, 1e-4), 0.48);
     }
     function setSun() {
       sunDir.setFromSphericalCoords(1, Math.PI / 2 - SUN_ELEV, sunTheta);
@@ -1352,14 +1475,15 @@
       renderer.setRenderTarget(dofRT);
       dofQuad.render(renderer);
 
-      // 6. bloom (adds into dofRT)
-      bloom.render(renderer, null, dofRT, dt, false);
+      // 6. bloom
+      compMat.uniforms.tBloom.value = bloom.render(renderer, dofRT.texture, size.x, size.y);
+      compMat.uniforms.tDepth.value = sceneRT.depthTexture;
 
       // 7. lens + film composite to screen
       _sp.copy(sunDir).multiplyScalar(1000).add(camera.position).project(camera);
       const onScreen = _sp.z < 1 && Math.abs(_sp.x) < 1.2 && Math.abs(_sp.y) < 1.2;
       compMat.uniforms.uSunUV.value.set(_sp.x * 0.5 + 0.5, _sp.y * 0.5 + 0.5);
-      compMat.uniforms.uSunVis.value = onScreen ? (1 - Math.max(Math.abs(_sp.x), Math.abs(_sp.y)) / 1.2) : 0;
+      compMat.uniforms.uSunVis.value = onScreen ? Math.max(0, 1 - Math.hypot(_sp.x * camera.aspect, _sp.y) / (1.3 * camera.aspect)) : 0;
       compMat.uniforms.uTime.value = t;
       compMat.uniforms.tColor.value = dofRT.texture;
       compMat.uniforms.uRes.value.copy(size);
