@@ -83,7 +83,7 @@
     // ?cycle=<seconds> changes the loop length.
     const deg = THREE.MathUtils.degToRad;
     const SUN_FIXED = params.has('sun');
-    const SUN_HIGH = 9.0, SUN_LOW = -4.5, SUN_START = 5.5;
+    const SUN_HIGH = 9.0, SUN_LOW = -3.5, SUN_START = 5.5;
     const SUN_CYCLE = params.has('cycle') ? Math.max(10, parseFloat(params.get('cycle'))) : 480;
     const SUN_PHASE0 = Math.acos((SUN_START - (SUN_HIGH + SUN_LOW) / 2) / ((SUN_HIGH - SUN_LOW) / 2)); // starts at 5.5 deg, setting
     function sunElevation(t) {
@@ -1337,7 +1337,7 @@
       // auto exposure: meter on direct sun + sky light, like a camera in program mode
       const key = luma(sunE) * 0.25 + luma(amb);
       // (the gain is capped so dusk reads as dusk instead of being pumped back to daylight)
-      targetExposure = BASE_EV * THREE.MathUtils.clamp(Math.pow(REF_KEY / Math.max(key, 1e-5), 0.48), 0.2, 2.2);
+      targetExposure = BASE_EV * THREE.MathUtils.clamp(Math.pow(REF_KEY / Math.max(key, 1e-5), 0.55), 0.2, 6.0);
     }
     function setSun() {
       sunDir.setFromSphericalCoords(1, Math.PI / 2 - SUN_ELEV, sunTheta);
