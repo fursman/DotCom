@@ -1037,7 +1037,7 @@
             vec2 rel = xz - d.xy;
             float r2 = dot(rel, rel);
             float R = 3.4 * d.w;
-            if (r2 > (R + 30.0) * (R + 30.0)) continue;
+            if (r2 > (R + 12.0) * (R + 12.0)) continue;
             float c = cos(d.z), s = sin(d.z);
             vec2 loc = vec2(rel.x * c - rel.y * s, rel.x * s + rel.y * c) / d.w;
             float e = length(loc / vec2(2.55, 3.25));
@@ -1045,7 +1045,8 @@
             if (edge < -0.5) continue;
             edge = max(edge, 0.0);
             vec4 db = uDuckB[j];
-            float amp = (0.05 + 0.35 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 9.0);
+            // kept faint and short-lived so the wind texture on the water stays dominant
+            float amp = (0.006 + 0.03 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 2.5);
             float ph = edge * 1.6 - uTime * 4.2 + db.y;
             vec2 radial = rel / max(sqrt(r2), 1e-3);
             slope += radial * amp * cos(ph) * smoothstep(0.0, 0.6, edge);
