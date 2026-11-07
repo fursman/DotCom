@@ -1,0 +1,1407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>We can make anything</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦾</text></svg>">
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #curtain { position: fixed; inset: 0; background: #000; pointer-events: none; transition: opacity 2.5s ease; z-index: 2; }
+    #curtain.gone { opacity: 0; }
+    #nogl { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; color: #aaa; font: 16px monospace; z-index: 3; }
+    #nogl a { color: #fff; }
+  </style>
+</head>
+<body>
+  <div id="curtain"></div>
+  <div id="nogl">This one needs WebGL2. <a href="/">Back to the ducks</a></div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
+
+    // ------------------------------------------------------------------
+    //  Setup & quality
+    // ------------------------------------------------------------------
+    const params = new URLSearchParams(location.search);
+    const probe = document.createElement('canvas').getContext('webgl2');
+    if (!probe) { document.getElementById('nogl').style.display = 'flex'; throw new Error('no webgl2'); }
+
+    const isMobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 900;
+    const maxDpr = isMobile ? 1.25 : 1.75;
+    let renderScale = params.has('scale') ? parseFloat(params.get('scale')) : 1.0;
+    const adaptive = !params.has('scale');
+    const CUBE_SIZE = isMobile ? 256 : 512;
+
+    const CAPTURE = params.has('capture');   // deterministic, on-demand frames (for screenshots)
+    // keep the HDR/MSAA buffers within a sane pixel budget on 4K / retina screens
+    const PIXEL_BUDGET = isMobile ? 1.6e6 : 3.7e6;
+    const pixelRatio = () => Math.min(devicePixelRatio, maxDpr, Math.sqrt(PIXEL_BUDGET / (innerWidth * innerHeight))) * renderScale;
+    const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', preserveDrawingBuffer: CAPTURE });
+    renderer.setPixelRatio(pixelRatio());
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.toneMapping = params.get('tm') === 'agx' ? THREE.AgXToneMapping : THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 60000);
+    camera.position.set(0, 30, 100);
+    camera.layers.enable(0);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.maxPolarAngle = Math.PI * 0.495;
+    controls.target.set(0, 10, 0);
+    controls.minDistance = 40;
+    controls.maxDistance = 200;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.06;
+    controls.update();
+
+    // ------------------------------------------------------------------
+    //  Physical atmosphere (shared constants between JS and GLSL)
+    //  Units: kilometres. Single scattering Rayleigh + Mie + ozone.
+    // ------------------------------------------------------------------
+    const SUN_ELEV = THREE.MathUtils.degToRad(params.has('sun') ? parseFloat(params.get('sun')) : 0.5);   // same as the original page
+    const SUN_E = 20.0;                               // solar irradiance (arbitrary HDR units)
+    const MIE = 1.3;                                  // light golden-hour aerosol load
+    const OZONE = 2.0;
+    let sunTheta = Math.PI;
+    const sunDir = new THREE.Vector3();
+
+    const ATMO_GLSL = /* glsl */`
+      const float PR = 6360.0;
+      const float AR = 6420.0;
+      const vec3  BR = vec3(5.802e-3, 13.558e-3, 33.1e-3);
+      const float BMS = 3.996e-3;
+      const float BME = 4.440e-3;
+      const vec3  BO = vec3(0.650e-3, 1.881e-3, 0.085e-3) * ${OZONE.toFixed(2)};
+      const float HR = 8.0;
+      const float HM = 1.2;
+      const float MIE = ${MIE.toFixed(3)};
+      const float SUN_E = ${SUN_E.toFixed(3)};
+      const float PI = 3.14159265;
+
+      vec2 raySphere(vec3 ro, vec3 rd, float r) {
+        float b = dot(ro, rd);
+        float c = dot(ro, ro) - r * r;
+        float d = b * b - c;
+        if (d < 0.0) return vec2(-1.0);
+        d = sqrt(d);
+        return vec2(-b - d, -b + d);
+      }
+      vec3 dens(float h) {
+        return vec3(exp(-h / HR), exp(-h / HM), max(0.0, 1.0 - abs(h - 25.0) / 15.0));
+      }
+      vec3 extinction(vec3 d) { return BR * d.x + vec3(BME * MIE * d.y) + BO * d.z; }
+      vec3 sunTransmittance(vec3 p, vec3 L) {
+        float t = raySphere(p, L, AR).y;
+        vec3 od = vec3(0.0);
+        float ds = t / 6.0;
+        for (int i = 0; i < 6; i++) {
+          vec3 q = p + L * ((float(i) + 0.5) * ds);
+          od += extinction(dens(length(q) - PR)) * ds;
+        }
+        // soft planet shadow
+        float h = length(p);
+        float horizonCos = -sqrt(max(0.0, 1.0 - (PR * PR) / (h * h)));
+        float s = smoothstep(horizonCos - 0.01, horizonCos + 0.005, dot(normalize(p), L));
+        return exp(-od) * s;
+      }
+      float phaseR(float mu) { return 3.0 / (16.0 * PI) * (1.0 + mu * mu); }
+      float phaseHG(float mu, float g) {
+        float g2 = g * g;
+        return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+      }
+      vec3 atmosphere(vec3 rd, vec3 L) {
+        vec3 ro = vec3(0.0, PR + 0.01, 0.0);
+        float tmax = raySphere(ro, rd, AR).y;
+        float mu = dot(rd, L);
+        float pr = phaseR(mu);
+        float pm = phaseHG(mu, 0.76);
+        vec3 sumR = vec3(0.0), sumM = vec3(0.0), od = vec3(0.0);
+        const int N = 20;
+        for (int i = 0; i < N; i++) {
+          float a = float(i) / float(N), b = float(i + 1) / float(N);
+          float t0 = tmax * a * a, t1 = tmax * b * b;
+          float ds = t1 - t0;
+          vec3 p = ro + rd * (0.5 * (t0 + t1));
+          vec3 d = dens(length(p) - PR);
+          vec3 e = extinction(d) * ds;
+          od += 0.5 * e;
+          vec3 T = exp(-od) * sunTransmittance(p, L);
+          od += 0.5 * e;
+          sumR += T * d.x * ds;
+          sumM += T * d.y * ds;
+        }
+        vec3 single = SUN_E * (sumR * BR * pr + sumM * (BMS * MIE) * pm);
+        // cheap multiple-scattering lift (keeps the zenith from going grey/black at sunset)
+        vec3 ms = SUN_E * (sumR * BR + sumM * (BMS * MIE)) * (1.0 / (4.0 * PI)) * 0.3;
+        return single + ms;
+      }
+    `;
+
+    // ---- JS port of the same model (used for light colours / ambient terms)
+    const A = { PR: 6360, AR: 6420, BR: [5.802e-3, 13.558e-3, 33.1e-3], BMS: 3.996e-3, BME: 4.44e-3, BO: [0.65e-3, 1.881e-3, 0.085e-3], HR: 8, HM: 1.2 };
+    function jRaySphere(o, d, r) {
+      const b = o[0] * d[0] + o[1] * d[1] + o[2] * d[2];
+      const c = o[0] * o[0] + o[1] * o[1] + o[2] * o[2] - r * r;
+      let k = b * b - c; if (k < 0) return [-1, -1]; k = Math.sqrt(k); return [-b - k, -b + k];
+    }
+    function jExt(h) {
+      const dr = Math.exp(-h / A.HR), dm = Math.exp(-h / A.HM), dO = Math.max(0, 1 - Math.abs(h - 25) / 15);
+      return [0, 1, 2].map(i => A.BR[i] * dr + A.BME * MIE * dm + A.BO[i] * OZONE * dO);
+    }
+    function jSunT(p, L) {
+      const t = jRaySphere(p, L, A.AR)[1], ds = t / 8; const od = [0, 0, 0];
+      for (let i = 0; i < 8; i++) {
+        const s = (i + 0.5) * ds; const q = [p[0] + L[0] * s, p[1] + L[1] * s, p[2] + L[2] * s];
+        const e = jExt(Math.hypot(q[0], q[1], q[2]) - A.PR); od[0] += e[0] * ds; od[1] += e[1] * ds; od[2] += e[2] * ds;
+      }
+      return od.map(v => Math.exp(-v));
+    }
+    function jSky(rd, L) {
+      const ro = [0, A.PR + 0.01, 0]; const tmax = jRaySphere(ro, rd, A.AR)[1];
+      const mu = rd[0] * L[0] + rd[1] * L[1] + rd[2] * L[2];
+      const pr = 3 / (16 * Math.PI) * (1 + mu * mu), g = 0.76;
+      const pm = (1 - g * g) / (4 * Math.PI * Math.pow(1 + g * g - 2 * g * mu, 1.5));
+      const sR = [0, 0, 0], sM = [0, 0, 0], od = [0, 0, 0]; const N = 12;
+      for (let i = 0; i < N; i++) {
+        const t0 = tmax * (i / N) ** 2, t1 = tmax * ((i + 1) / N) ** 2, ds = t1 - t0, tm = (t0 + t1) / 2;
+        const p = [ro[0] + rd[0] * tm, ro[1] + rd[1] * tm, ro[2] + rd[2] * tm];
+        const h = Math.hypot(p[0], p[1], p[2]) - A.PR; const e = jExt(h);
+        const dr = Math.exp(-h / A.HR), dm = Math.exp(-h / A.HM); const Ts = jSunT(p, L);
+        for (let c = 0; c < 3; c++) { od[c] += 0.5 * e[c] * ds; const T = Math.exp(-od[c]) * Ts[c]; od[c] += 0.5 * e[c] * ds; sR[c] += T * dr * ds; sM[c] += T * dm * ds; }
+      }
+      return [0, 1, 2].map(c => SUN_E * (sR[c] * A.BR[c] * pr + sM[c] * A.BMS * MIE * pm) + SUN_E * (sR[c] * A.BR[c] + sM[c] * A.BMS * MIE) / (4 * Math.PI) * 0.3);
+    }
+
+    // ------------------------------------------------------------------
+    //  3D cloud noise (tileable Perlin-Worley), baked on the GPU once
+    // ------------------------------------------------------------------
+    const NOISE_SIZE = 128;
+    const noiseRT = new THREE.WebGL3DRenderTarget(NOISE_SIZE, NOISE_SIZE, NOISE_SIZE, { depthBuffer: false });
+    Object.assign(noiseRT.texture, { wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, wrapR: THREE.RepeatWrapping, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false });
+    {
+      const mat = new THREE.ShaderMaterial({
+        uniforms: { uZ: { value: 0 } },
+        vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+        fragmentShader: /* glsl */`
+          varying vec2 vUv; uniform float uZ;
+          vec3 hash33(vec3 p) {
+            p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+            p += dot(p, p.yxz + 33.33);
+            return fract((p.xxy + p.yxx) * p.zyx);
+          }
+          float gradNoise(vec3 x, float freq) {
+            vec3 p = floor(x), w = fract(x);
+            vec3 u = w * w * w * (w * (w * 6.0 - 15.0) + 10.0);
+            float n = 0.0;
+            float r[8];
+            for (int i = 0; i < 8; i++) {
+              vec3 o = vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
+              vec3 g = normalize(hash33(mod(p + o, freq)) * 2.0 - 1.0);
+              r[i] = dot(g, w - o);
+            }
+            return mix(mix(mix(r[0], r[1], u.x), mix(r[2], r[3], u.x), u.y),
+                       mix(mix(r[4], r[5], u.x), mix(r[6], r[7], u.x), u.y), u.z);
+          }
+          float worley(vec3 uv, float freq) {
+            vec3 id = floor(uv), p = fract(uv);
+            float md = 1e4;
+            for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) for (int z = -1; z <= 1; z++) {
+              vec3 o = vec3(x, y, z);
+              vec3 h = hash33(mod(id + o, vec3(freq))) + o;
+              vec3 d = p - h;
+              md = min(md, dot(d, d));
+            }
+            return 1.0 - sqrt(md);
+          }
+          float perlinFbm(vec3 p, float freq, int oct) {
+            float G = exp2(-0.85), amp = 1.0, noise = 0.0;
+            for (int i = 0; i < oct; i++) { noise += amp * gradNoise(p * freq, freq); freq *= 2.0; amp *= G; }
+            return noise;
+          }
+          float worleyFbm(vec3 p, float freq) {
+            return worley(p * freq, freq) * 0.625 + worley(p * freq * 2.0, freq * 2.0) * 0.25 + worley(p * freq * 4.0, freq * 4.0) * 0.125;
+          }
+          float remap(float x, float a, float b, float c, float d) { return c + (x - a) / (b - a) * (d - c); }
+          void main() {
+            vec3 uvw = vec3(vUv, uZ);
+            float freq = 4.0;
+            float pfbm = mix(1.0, perlinFbm(uvw, 4.0, 7), 0.5);
+            pfbm = abs(pfbm * 2.0 - 1.0);
+            float g = worleyFbm(uvw, freq);
+            float b = worleyFbm(uvw, freq * 2.0);
+            float a = worleyFbm(uvw, freq * 4.0);
+            float r = clamp(remap(pfbm, 0.0, 1.0, g, 1.0), 0.0, 1.0);
+            gl_FragColor = vec4(r, g, b, a);
+          }`
+      });
+      const q = new FullScreenQuad(mat);
+      for (let z = 0; z < NOISE_SIZE; z++) {
+        mat.uniforms.uZ.value = (z + 0.5) / NOISE_SIZE;
+        renderer.setRenderTarget(noiseRT, z);
+        q.render(renderer);
+      }
+      renderer.setRenderTarget(null);
+      q.dispose(); mat.dispose();
+    }
+
+    // ------------------------------------------------------------------
+    //  Sky + volumetric clouds, rendered into an HDR cubemap
+    //  (one face per frame, so the expensive raymarch is amortised)
+    // ------------------------------------------------------------------
+    const cubeRT = new THREE.WebGLCubeRenderTarget(CUBE_SIZE, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    const cubeCam = new THREE.CubeCamera(0.1, 10, cubeRT);
+    cubeCam.coordinateSystem = renderer.coordinateSystem;
+    cubeCam.updateCoordinateSystem();
+    cubeCam.updateMatrixWorld(true);
+    const cubeScene = new THREE.Scene();
+
+    const skyCubeMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, depthTest: false,
+      uniforms: {
+        uSun: { value: new THREE.Vector3() },
+        uTime: { value: 0 },
+        uNoise: { value: noiseRT.texture },
+        uSunCloud: { value: new THREE.Vector3() },
+        uAmb: { value: new THREE.Vector3() },
+        uCoverage: { value: params.has('cov') ? parseFloat(params.get('cov')) : 0.3 },
+        uSunHigh: { value: new THREE.Vector3() },
+        uWind: { value: new THREE.Vector2(0.010, 0.004) },
+        uWaterTint: { value: new THREE.Vector3(0.002, 0.008, 0.008) }
+      },
+      vertexShader: `varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        precision highp sampler3D;
+        varying vec3 vDir;
+        uniform vec3 uSun, uSunCloud, uSunHigh, uAmb, uWaterTint;
+        uniform float uTime, uCoverage;
+        uniform vec2 uWind;
+        uniform sampler3D uNoise;
+        ${ATMO_GLSL}
+
+        const float CB = 1.25;  // cloud base (km)
+        const float CT = 3.1;   // cloud top (km)
+        const float SIGMA = 28.0;
+
+        float remap(float x, float a, float b, float c, float d) { return c + (x - a) / (b - a) * (d - c); }
+        float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+
+        float cloudDensity(vec3 p, bool detail) {
+          float h = (length(p) - PR - CB) / (CT - CB);
+          if (h < 0.0 || h > 1.0) return 0.0;
+          vec3 q = p - vec3(0.0, PR, 0.0);
+          q.xz += uWind * uTime;
+          float weather = texture(uNoise, vec3(q.xz * 0.011, 0.37)).r;
+          float weather2 = texture(uNoise, vec3(q.xz * 0.004 + 0.3, 0.71)).g;
+          float cov = clamp(uCoverage + (weather - 0.55) * 0.9 + (weather2 - 0.5) * 0.5, 0.0, 1.0);
+          vec4 n = texture(uNoise, q * vec3(0.075, 0.11, 0.075));
+          float wf = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
+          float base = remap(n.r, wf - 1.0, 1.0, 0.0, 1.0);
+          float prof = smoothstep(0.0, 0.08, h) * smoothstep(1.0, 0.35, h);
+          // flatter, darker bases with puffy tops
+          base *= prof;
+          base = clamp(remap(base, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+          if (detail && base > 0.0) {
+            vec4 d = texture(uNoise, q * 0.42 + vec3(0.0, uTime * 0.003, 0.0));
+            float df = d.g * 0.625 + d.b * 0.25 + d.a * 0.125;
+            df = mix(df, 1.0 - df, clamp(h * 3.0, 0.0, 1.0));
+            base = clamp(remap(base, df * 0.38, 1.0, 0.0, 1.0), 0.0, 1.0);
+          }
+          return base;
+        }
+
+        float lightMarch(vec3 p) {
+          float od = 0.0;
+          float ds = 0.06;
+          vec3 pos = p;
+          for (int i = 0; i < 6; i++) {
+            pos += uSun * ds;
+            od += cloudDensity(pos, i < 2) * ds;
+            ds *= 1.8;
+          }
+          return od * SIGMA * 0.5;
+        }
+
+        float dualPhase(float mu, float scale) {
+          return mix(phaseHG(mu, 0.8 * scale), phaseHG(mu, -0.25 * scale), 0.25);
+        }
+
+        // returns rgb = in-scattered light (premultiplied), a = transmittance, also outputs mean distance
+        vec4 clouds(vec3 rd, out float dist) {
+          dist = 0.0;
+          if (rd.y <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+          vec3 ro = vec3(0.0, PR + 0.01, 0.0);
+          float t0 = raySphere(ro, rd, PR + CB).y;
+          float t1 = raySphere(ro, rd, PR + CT).y;
+          if (t0 > 160.0) return vec4(0.0, 0.0, 0.0, 1.0);
+          t1 = min(t1, t0 + 22.0);
+          const int N = ${isMobile ? 36 : 56};
+          float dt = (t1 - t0) / float(N);
+          float t = t0 + dt * hash12(gl_FragCoord.xy);
+          float mu = dot(rd, uSun);
+          vec3 S = vec3(0.0);
+          float T = 1.0;
+          float tw = 0.0, ww = 0.0;
+          for (int i = 0; i < N; i++) {
+            vec3 p = ro + rd * t;
+            float den = cloudDensity(p, true);
+            if (den > 0.002) {
+              float h = clamp((length(p) - PR - CB) / (CT - CB), 0.0, 1.0);
+              float od = lightMarch(p);
+              // multiple-scattering octaves (Hillaire 2016)
+              vec3 sun = vec3(0.0);
+              float a = 1.0, b = 1.0, c = 1.0;
+              for (int o = 0; o < 4; o++) {
+                sun += a * dualPhase(mu, c) * exp(-od * b);
+                a *= 0.55; b *= 0.4; c *= 0.6;
+              }
+              // powder / dark-edge term
+              float powder = 1.0 - exp(-den * SIGMA * 0.12);
+              vec3 amb = uAmb * mix(0.5, 1.6, h) * (0.6 + 0.4 * powder);
+              vec3 lum = uSunCloud * sun * mix(0.6, 1.0, powder) * 4.0 * PI * 0.25 + amb;
+              float ext = den * SIGMA;
+              float Ts = exp(-ext * dt);
+              S += T * lum * (1.0 - Ts);
+              tw += t * T * (1.0 - Ts); ww += T * (1.0 - Ts);
+              T *= Ts;
+              if (T < 0.01) break;
+            }
+            t += dt;
+          }
+          dist = ww > 0.0 ? tw / ww : t0;
+          float fade = smoothstep(160.0, 90.0, t0);
+          return vec4(S * fade, mix(1.0, T, fade));
+        }
+
+        void main() {
+          vec3 rd = normalize(vDir);
+          if (rd.y < 0.0) {
+            // below the horizon: reflective sea (used for image based lighting only)
+            vec3 rr = vec3(rd.x, -rd.y, rd.z);
+            float c = clamp(-rd.y, 0.0, 1.0);
+            float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
+            vec3 sky = atmosphere(rr, uSun);
+            gl_FragColor = vec4(sky * F + uWaterTint * uAmb * 3.0, 1.0);
+            return;
+          }
+          vec3 sky = atmosphere(rd, uSun);
+          // high cirrus / altocumulus veil (catches the last pink light)
+          {
+            vec3 ro = vec3(0.0, PR + 0.01, 0.0);
+            float tc = raySphere(ro, rd, PR + 7.5).y;
+            vec3 q = ro + rd * tc - vec3(0.0, PR, 0.0);
+            vec2 uv = q.xz + uWind * uTime * 2.5;
+            vec2 w = uv * 0.012;
+            vec2 warp = vec2(texture(uNoise, vec3(w * 0.7, 0.2)).g, texture(uNoise, vec3(w * 0.7 + 0.5, 0.6)).g);
+            vec2 st = mat2(0.8, -0.6, 0.6, 0.8) * (uv * vec2(0.018, 0.036)) + warp * 0.3;
+            float c = texture(uNoise, vec3(st, 0.45)).r * 0.65 + texture(uNoise, vec3(st * 3.1, 0.8)).g * 0.35;
+            float m = texture(uNoise, vec3(uv * 0.0035, 0.9)).g;
+            float den = smoothstep(0.58, 0.9, c) * smoothstep(0.45, 0.75, m) * 0.8;
+            den *= smoothstep(0.0, 0.04, rd.y) * smoothstep(420.0, 150.0, tc);
+            float mu = dot(rd, uSun);
+            vec3 lum = uSunHigh * (phaseHG(mu, 0.6) * 0.7 + 0.3 / (4.0 * PI)) * PI * 1.3 + uAmb * 1.2;
+            float a = 1.0 - exp(-den * 1.6);
+            float fog = 1.0 - exp(-tc / 90.0);
+            sky = mix(sky, mix(lum, sky, fog), a);
+          }
+          float d;
+          vec4 cl = clouds(rd, d);
+          // aerial perspective on cloud light
+          float fog = 1.0 - exp(-d / 38.0);
+          vec3 col = sky * cl.a + mix(cl.rgb, sky * (1.0 - cl.a), fog);
+          gl_FragColor = vec4(col, cl.a);
+        }
+      `
+    });
+    cubeScene.add(new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), skyCubeMat));
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    let envRT = null;
+    let cubeFace = 0;
+    function renderCubeFace(i) {
+      renderer.setRenderTarget(cubeRT, i);
+      renderer.render(cubeScene, cubeCam.children[i]);
+    }
+    function rebuildEnv() {
+      envRT = pmrem.fromCubemap(cubeRT.texture, envRT);
+      scene.environment = envRT.texture;
+    }
+
+    // ------------------------------------------------------------------
+    //  Sky dome for the main view (samples the cubemap + analytic sun disk)
+    // ------------------------------------------------------------------
+    const SUN_ANG = THREE.MathUtils.degToRad(0.32);
+    const skyDomeMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, depthTest: false,
+      uniforms: {
+        uSky: { value: cubeRT.texture },
+        uSun: { value: sunDir },
+        uSunCos: { value: Math.cos(SUN_ANG) },
+        uSunDisk: { value: new THREE.Vector3() },
+        uNoSun: { value: 0 }
+      },
+      vertexShader: /* glsl */`
+        varying vec3 vDir;
+        void main() {
+          vDir = position;
+          vec4 p = projectionMatrix * viewMatrix * vec4(cameraPosition + position * 30000.0, 1.0);
+          p.z = p.w * 0.999999;
+          gl_Position = p;
+        }`,
+      fragmentShader: /* glsl */`
+        varying vec3 vDir;
+        uniform samplerCube uSky;
+        uniform vec3 uSun, uSunDisk;
+        uniform float uSunCos, uNoSun;
+        void main() {
+          vec3 d = normalize(vDir);
+          vec3 dd = normalize(vec3(d.x, max(d.y, 0.0008), d.z));
+          vec4 s = texture(uSky, dd);
+          vec3 col = s.rgb;
+          if (uNoSun < 0.5) {
+            float c = dot(d, uSun);
+            float w = fwidth(c) * 1.5;
+            float disk = smoothstep(uSunCos - w, uSunCos + w, c);
+            if (disk > 0.0) {
+              float r = clamp(acos(clamp(c, -1.0, 1.0)) / acos(uSunCos), 0.0, 1.0);
+              float mu = sqrt(max(0.0, 1.0 - r * r));
+              vec3 limb = vec3(1.0) - vec3(0.397, 0.503, 0.652) * (1.0 - pow(vec3(mu), vec3(0.6)));
+              col += uSunDisk * limb * disk * s.a;
+            }
+          }
+          gl_FragColor = vec4(col, 1.0);
+        }`
+    });
+    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), skyDomeMat);
+    skyDome.frustumCulled = false;
+    skyDome.renderOrder = -1000;
+    scene.add(skyDome);
+
+    // ------------------------------------------------------------------
+    //  Waves: shared between the GPU water and CPU duck buoyancy
+    // ------------------------------------------------------------------
+    const GRAV = 40.0; // effective gravity in scene units (ducks read as ~1.5m giants on a slow swell)
+    let seed = 7;
+    const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
+    const windAng = Math.atan2(0.6, 0.8);
+    const swell = [];
+    [[260, 0.30, 0.0], [175, 0.20, 0.45], [118, 0.13, -0.5], [74, 0.07, 0.9]].forEach(([wl, amp, da]) => {
+      const k = 2 * Math.PI / wl, a = windAng + da;
+      swell.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp, w: Math.sqrt(GRAV * k), ph: rand() * 6.283, q: 0.35 });
+    });
+    const DETAIL = 32;
+    const detail = [];
+    for (let i = 0; i < DETAIL; i++) {
+      const f = i / (DETAIL - 1);
+      const wl = 42 * Math.pow(0.55 / 42, f);
+      const k = 2 * Math.PI / wl;
+      const spread = 0.5 + 1.1 * f;
+      const a = windAng + (rand() * 2 - 1) * spread;
+      const slope = 0.019 * (0.6 + 0.4 * Math.sin(f * 3.1)) * (0.75 + 0.5 * rand());
+      detail.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp: slope / k, w: Math.sqrt(GRAV * k + 2.5 * k * k * k), ph: rand() * 6.283 });
+    }
+    function waveHeight(x, z, t) {
+      let h = 0;
+      for (const s of swell) h += s.amp * Math.sin(s.k * (s.dx * x + s.dz * z) - s.w * t + s.ph);
+      return h;
+    }
+    function waveSlope(x, z, t) {
+      let sx = 0, sz = 0;
+      for (const s of swell) { const c = s.amp * s.k * Math.cos(s.k * (s.dx * x + s.dz * z) - s.w * t + s.ph); sx += s.dx * c; sz += s.dz * c; }
+      return [sx, sz];
+    }
+
+    // ------------------------------------------------------------------
+    //  Rubber duck: a single molded surface sculpted as a signed distance
+    //  field, meshed with surface nets, shaded as glossy vinyl.
+    // ------------------------------------------------------------------
+    function sdEll(x, y, z, rx, ry, rz) {
+      const ax = x / rx, ay = y / ry, az = z / rz;
+      const k0 = Math.sqrt(ax * ax + ay * ay + az * az);
+      const bx = ax / rx, by = ay / ry, bz = az / rz;
+      const k1 = Math.sqrt(bx * bx + by * by + bz * bz);
+      return k1 < 1e-9 ? -Math.min(rx, ry, rz) : k0 * (k0 - 1) / k1;
+    }
+    function smin(a, b, k) { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h * h * k * 0.25; }
+    function smax(a, b, k) { return -smin(-a, -b, k); }
+    const duckParts = { body: 0, beak: 0 };
+    function duckSDF(x, y, z) {
+      // egg-shaped body
+      const taper = 1 + 0.06 * (-z / 3.4);
+      let b = sdEll(x / taper, y, z, 2.7, 2.0, 3.4);
+      b = smin(b, sdEll(x, y - 0.35, z - 1.5, 2.3, 1.8, 2.1), 0.8);
+      // upturned tail
+      {
+        const c = Math.cos(-0.65), s = Math.sin(-0.65);
+        const ty = y - 1.05, tz = z + 2.75;
+        b = smin(b, sdEll(x, ty * c - tz * s, ty * s + tz * c, 1.05, 0.85, 0.95), 1.0);
+      }
+      {
+        const c = Math.cos(-0.95), s = Math.sin(-0.95);
+        const ty = y - 1.85, tz = z + 3.3;
+        b = smin(b, sdEll(x * (1 + 0.5 * Math.max(0, ty)), ty * c - tz * s, ty * s + tz * c, 0.5, 0.72, 0.26), 0.6);
+      }
+      // wings
+      for (const sg of [-1, 1]) {
+        const wx = x - sg * 2.32, wy0 = y - 0.75, wz0 = z + 0.5;
+        const c = Math.cos(0.32), s = Math.sin(0.32);
+        const wy = wy0 * c - wz0 * s, wz = wy0 * s + wz0 * c;
+        const c2 = Math.cos(sg * 0.12), s2 = Math.sin(sg * 0.12);
+        const rx = wx * c2 - wz * s2, rz = wx * s2 + wz * c2;
+        b = smin(b, sdEll(rx, wy, rz, 0.5, 1.1, 1.95), 0.3);
+      }
+      // flat bottom
+      b = smax(b, -(y + 1.45), 0.5);
+      // head
+      const h = sdEll(x, y - 3.05, z - 1.85, 1.92, 1.82, 1.86);
+      const body = smin(b, h, 1.2);
+      // bill (slightly downturned, wide)
+      let beak;
+      {
+        const c = Math.cos(0.14), s = Math.sin(0.14);
+        const by0 = y - 2.6, bz0 = z - 3.5;
+        const by = by0 * c - bz0 * s, bz = by0 * s + bz0 * c;
+        const widen = 1 + 0.18 * Math.max(0, bz);
+        beak = sdEll(x / widen, by, bz, 1.0, 0.42, 1.1);
+      }
+      duckParts.body = body; duckParts.beak = beak;
+      return smin(body, beak, 0.2);
+    }
+
+    function buildDuckGeometry() {
+      const N = isMobile ? 64 : 84;
+      const lo = [-3.4, -1.9, -4.3], hi = [3.4, 5.2, 5.1];
+      const step = [(hi[0] - lo[0]) / (N - 1), (hi[1] - lo[1]) / (N - 1), (hi[2] - lo[2]) / (N - 1)];
+      const field = new Float32Array(N * N * N);
+      const idx = (i, j, k) => i + N * (j + N * k);
+      for (let k = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++)
+        field[idx(i, j, k)] = duckSDF(lo[0] + i * step[0], lo[1] + j * step[1], lo[2] + k * step[2]);
+
+      const cellVert = new Int32Array((N - 1) * (N - 1) * (N - 1)).fill(-1);
+      const cidx = (i, j, k) => i + (N - 1) * (j + (N - 1) * k);
+      const pos = [], nor = [], col = [], ind = [];
+      const edges = [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]];
+      const grad = (x, y, z) => {
+        const e = 0.004;
+        const gx = duckSDF(x + e, y, z) - duckSDF(x - e, y, z);
+        const gy = duckSDF(x, y + e, z) - duckSDF(x, y - e, z);
+        const gz = duckSDF(x, y, z + e) - duckSDF(x, y, z - e);
+        const l = Math.hypot(gx, gy, gz) || 1; return [gx / l, gy / l, gz / l];
+      };
+      const yellow = new THREE.Color(0xffc80a), orange = new THREE.Color(0xff7a00);
+      for (let k = 0; k < N - 1; k++) for (let j = 0; j < N - 1; j++) for (let i = 0; i < N - 1; i++) {
+        const v = [];
+        let mask = 0;
+        for (let c = 0; c < 8; c++) {
+          const val = field[idx(i + (c & 1), j + ((c >> 1) & 1), k + ((c >> 2) & 1))];
+          v.push(val); if (val < 0) mask |= 1 << c;
+        }
+        if (mask === 0 || mask === 255) continue;
+        let px = 0, py = 0, pz = 0, n = 0;
+        for (const [a, b] of edges) {
+          if ((v[a] < 0) === (v[b] < 0)) continue;
+          const t = v[a] / (v[a] - v[b]);
+          const ax = a & 1, ay = (a >> 1) & 1, az = (a >> 2) & 1, bx = b & 1, by = (b >> 1) & 1, bz = (b >> 2) & 1;
+          px += ax + (bx - ax) * t; py += ay + (by - ay) * t; pz += az + (bz - az) * t; n++;
+        }
+        let x = lo[0] + (i + px / n) * step[0], y = lo[1] + (j + py / n) * step[1], z = lo[2] + (k + pz / n) * step[2];
+        // project onto the true surface
+        for (let it = 0; it < 3; it++) { const d = duckSDF(x, y, z); const g = grad(x, y, z); x -= d * g[0]; y -= d * g[1]; z -= d * g[2]; }
+        const g = grad(x, y, z);
+        duckSDF(x, y, z);
+        const tB = THREE.MathUtils.smoothstep(duckParts.body - duckParts.beak, -0.03, 0.03);
+        const c = yellow.clone().lerp(orange, tB);
+        cellVert[cidx(i, j, k)] = pos.length / 3;
+        pos.push(x, y, z); nor.push(g[0], g[1], g[2]); col.push(c.r, c.g, c.b);
+      }
+      const quad = (a, b, c, d) => {
+        if (a < 0 || b < 0 || c < 0 || d < 0) return;
+        // orient using the field gradient
+        const P = i => [pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2]];
+        const pa = P(a), pb = P(b), pc = P(c);
+        const u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]], w = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+        const fn = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+        const nn = nor[a * 3] * fn[0] + nor[a * 3 + 1] * fn[1] + nor[a * 3 + 2] * fn[2];
+        if (nn >= 0) ind.push(a, b, c, a, c, d); else ind.push(a, c, b, a, d, c);
+      };
+      for (let k = 1; k < N - 1; k++) for (let j = 1; j < N - 1; j++) for (let i = 0; i < N - 1; i++) {
+        if ((field[idx(i, j, k)] < 0) === (field[idx(i + 1, j, k)] < 0)) continue;
+        quad(cellVert[cidx(i, j - 1, k - 1)], cellVert[cidx(i, j, k - 1)], cellVert[cidx(i, j, k)], cellVert[cidx(i, j - 1, k)]);
+      }
+      for (let k = 1; k < N - 1; k++) for (let j = 0; j < N - 1; j++) for (let i = 1; i < N - 1; i++) {
+        if ((field[idx(i, j, k)] < 0) === (field[idx(i, j + 1, k)] < 0)) continue;
+        quad(cellVert[cidx(i - 1, j, k - 1)], cellVert[cidx(i, j, k - 1)], cellVert[cidx(i, j, k)], cellVert[cidx(i - 1, j, k)]);
+      }
+      for (let k = 0; k < N - 1; k++) for (let j = 1; j < N - 1; j++) for (let i = 1; i < N - 1; i++) {
+        if ((field[idx(i, j, k)] < 0) === (field[idx(i, j, k + 1)] < 0)) continue;
+        quad(cellVert[cidx(i - 1, j - 1, k)], cellVert[cidx(i, j - 1, k)], cellVert[cidx(i, j, k)], cellVert[cidx(i - 1, j, k)]);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+      geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+      geo.setIndex(ind);
+      geo.computeBoundingSphere();
+      return geo;
+    }
+
+    function buildEyeGeometry() {
+      // painted eyes: white oval, black pupil, white glint — each a thin shell following the head
+      const pos = [], nor = [], col = [], ind = [];
+      const sph = new THREE.SphereGeometry(1, 24, 16);
+      const sp = sph.attributes.position, sn = sph.attributes.normal, si = sph.index.array;
+      const white = new THREE.Color(0xf6f4ee), black = new THREE.Color(0x030303);
+      const add = (m, c) => {
+        const base = pos.length / 3; const nm = new THREE.Matrix3().getNormalMatrix(m);
+        const v = new THREE.Vector3(), n = new THREE.Vector3();
+        for (let i = 0; i < sp.count; i++) {
+          v.fromBufferAttribute(sp, i).applyMatrix4(m); n.fromBufferAttribute(sn, i).applyMatrix3(nm).normalize();
+          pos.push(v.x, v.y, v.z); nor.push(n.x, n.y, n.z); col.push(c.r, c.g, c.b);
+        }
+        for (let i = 0; i < si.length; i++) ind.push(base + si[i]);
+      };
+      const g = (x, y, z) => { const e = 0.004; const v = new THREE.Vector3(duckSDF(x + e, y, z) - duckSDF(x - e, y, z), duckSDF(x, y + e, z) - duckSDF(x, y - e, z), duckSDF(x, y, z + e) - duckSDF(x, y, z - e)); return v.normalize(); };
+      for (const sg of [-1, 1]) {
+        const c0 = new THREE.Vector3(0, 3.05, 1.85);
+        const dir = new THREE.Vector3(sg * 0.6, 0.42, 0.68).normalize();
+        let t = 0; const p = new THREE.Vector3();
+        for (let i = 0; i < 200; i++) { p.copy(c0).addScaledVector(dir, t); if (duckSDF(p.x, p.y, p.z) > 0) break; t += 0.01; }
+        const n = g(p.x, p.y, p.z);
+        const up = new THREE.Vector3(0, 1, 0); const xAxis = new THREE.Vector3().crossVectors(up, n).normalize(); const yAxis = new THREE.Vector3().crossVectors(n, xAxis).normalize();
+        const basis = new THREE.Matrix4().makeBasis(xAxis, yAxis, n);
+        const place = (off, lift, sx, sy, sz, color) => {
+          const m = new THREE.Matrix4().copy(basis).scale(new THREE.Vector3(sx, sy, sz));
+          const pp = p.clone().addScaledVector(n, lift).addScaledVector(xAxis, off[0]).addScaledVector(yAxis, off[1]);
+          m.setPosition(pp); add(m, color);
+        };
+        const fwd = -sg; // toward the bill in the eye's local x
+        place([0, 0], -0.02, 0.44, 0.56, 0.06, white);
+        place([fwd * 0.1, 0.02], 0.012, 0.28, 0.37, 0.05, black);
+        place([fwd * 0.03, 0.15], 0.03, 0.075, 0.09, 0.035, white);
+      }
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+      geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+      geo.setIndex(ind);
+      return geo;
+    }
+
+    const duckGeo = buildDuckGeometry();
+    const eyeGeo = buildEyeGeometry();
+
+    const vinyl = new THREE.MeshPhysicalMaterial({
+      vertexColors: true, roughness: 0.36, metalness: 0.0,
+      clearcoat: 0.65, clearcoatRoughness: 0.14,
+      sheen: 0.25, sheenRoughness: 0.6, sheenColor: new THREE.Color(0xffe9a0),
+      envMapIntensity: 1.0
+    });
+    // subtle translucency: thin vinyl glows when back-lit by the low sun
+    vinyl.onBeforeCompile = (sh) => {
+      sh.uniforms.uSunDirV = { value: sunDir };
+      sh.uniforms.uSunColV = { value: new THREE.Vector3() };
+      vinyl.userData.shader = sh;
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform vec3 uSunDirV; uniform vec3 uSunColV;')
+        .replace('#include <opaque_fragment>', `
+          {
+            vec3 Vw = normalize(cameraPosition - vWorldPosV);
+            float back = pow(clamp(dot(-Vw, uSunDirV), 0.0, 1.0), 6.0);
+            float rim = pow(1.0 - clamp(dot(normalize(vWorldNormalV), Vw), 0.0, 1.0), 2.0);
+            outgoingLight += diffuseColor.rgb * uSunColV * back * (0.06 + 0.25 * rim);
+          }
+          #include <opaque_fragment>`)
+        .replace('void main() {', 'varying vec3 vWorldPosV; varying vec3 vWorldNormalV;\nvoid main() {');
+      sh.vertexShader = sh.vertexShader
+        .replace('void main() {', 'varying vec3 vWorldPosV; varying vec3 vWorldNormalV;\nvoid main() {')
+        .replace('#include <fog_vertex>', `#include <fog_vertex>
+          {
+            mat4 im = modelMatrix;
+            #ifdef USE_INSTANCING
+              im = modelMatrix * instanceMatrix;
+            #endif
+            vWorldPosV = (im * vec4(transformed, 1.0)).xyz;
+            vWorldNormalV = normalize(mat3(im) * objectNormal);
+          }`);
+    };
+    const paint = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.18, clearcoat: 1.0, clearcoatRoughness: 0.06 });
+
+    const DUCKS = 30;
+    const duckMesh = new THREE.InstancedMesh(duckGeo, vinyl, DUCKS);
+    const eyeMesh = new THREE.InstancedMesh(eyeGeo, paint, DUCKS);
+    for (const m of [duckMesh, eyeMesh]) {
+      m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false;
+      m.layers.enable(1);
+      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      scene.add(m);
+    }
+
+    const ducks = [];
+    for (let i = 0; i < DUCKS; i++) {
+      const s = 1 + Math.random() * 0.5;
+      const x = (Math.random() - 0.5) * 150, z = (Math.random() - 0.5) * 150;
+      ducks.push({
+        x, z, s, y: waveHeight(x, z, 0) + 0.5 * s, vy: 0,
+        yaw: Math.random() * Math.PI * 2,
+        driftX: (Math.random() - 0.5) * 0.05, driftZ: (Math.random() - 0.5) * 0.05,
+        rotateSpeed: (Math.random() - 0.5) * 0.005,
+        tx: 0, tz: 0, wob: Math.random() * 10
+      });
+    }
+
+    // ------------------------------------------------------------------
+    //  Sun light (shadows from the near-horizontal sun)
+    // ------------------------------------------------------------------
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.set(isMobile ? 2048 : 4096, isMobile ? 512 : 1024);
+    Object.assign(sunLight.shadow.camera, { left: -135, right: 135, top: 14, bottom: -8, near: 1, far: 700 });
+    sunLight.shadow.bias = -0.0004;
+    sunLight.shadow.normalBias = 0.06;
+    sunLight.shadow.radius = 3;
+    sunLight.layers.enable(1);
+    scene.add(sunLight, sunLight.target);
+
+    // ------------------------------------------------------------------
+    //  Render targets
+    // ------------------------------------------------------------------
+    const size = new THREE.Vector2();
+    const mkRT = (w, h, o = {}) => new THREE.WebGLRenderTarget(w, h, Object.assign({ type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }, o));
+    let sceneRT, reflRT, refrRT, dofRT, bloom;
+
+    function allocTargets() {
+      renderer.getDrawingBufferSize(size);
+      const w = size.x, h = size.y;
+      [sceneRT, reflRT, refrRT, dofRT].forEach(r => r && r.dispose());
+      sceneRT = mkRT(w, h, { samples: 4, depthTexture: new THREE.DepthTexture(w, h, THREE.FloatType) });
+      reflRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
+      refrRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { depthTexture: new THREE.DepthTexture(Math.ceil(w / 2), Math.ceil(h / 2), THREE.FloatType) });
+      dofRT = mkRT(w, h);
+      if (!bloom) bloom = new UnrealBloomPass(new THREE.Vector2(w, h), 0.32, 0.6, 1.1);
+      else bloom.setSize(w, h);
+    }
+    allocTargets();
+
+    // ------------------------------------------------------------------
+    //  Water
+    // ------------------------------------------------------------------
+    function buildWaterGeometry() {
+      const rings = [];
+      for (let r = 0; r <= 460; r += 3) rings.push(r);
+      let r = 460; while (r < 42000) { r *= 1.04; rings.push(Math.min(r, 42000)); }
+      const ANG = isMobile ? 256 : 384;
+      const pos = [], ind = [];
+      for (let i = 0; i < rings.length; i++) for (let a = 0; a < ANG; a++) {
+        const th = a / ANG * Math.PI * 2; pos.push(Math.cos(th) * rings[i], 0, Math.sin(th) * rings[i]);
+      }
+      for (let i = 0; i < rings.length - 1; i++) for (let a = 0; a < ANG; a++) {
+        const a1 = (a + 1) % ANG; const p0 = i * ANG + a, p1 = i * ANG + a1, p2 = (i + 1) * ANG + a, p3 = (i + 1) * ANG + a1;
+        ind.push(p0, p1, p2, p1, p3, p2);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      g.setIndex(ind);
+      return g;
+    }
+
+    const mirrorTexMatrix = new THREE.Matrix4();
+    const waterMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uSwellA: { value: swell.map(s => new THREE.Vector4(s.dx, s.dz, s.k, s.amp)) },
+        uSwellB: { value: swell.map(s => new THREE.Vector4(s.w, s.ph, s.q, 0)) },
+        uDetA: { value: detail.map(s => new THREE.Vector4(s.dx, s.dz, s.k, s.amp)) },
+        uDetB: { value: detail.map(s => new THREE.Vector4(s.w, s.ph, 0, 0)) },
+        uDuckA: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
+        uDuckB: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
+        uMirrorMatrix: { value: mirrorTexMatrix },
+        tRefl: { value: null },
+        tRefr: { value: null },
+        tRefrDepth: { value: null },
+        uSky: { value: cubeRT.texture },
+        uNoise: { value: noiseRT.texture },
+        uSun: { value: sunDir },
+        uSunE: { value: new THREE.Vector3() },
+        uSunVis: { value: 1 },
+        uAmb: { value: new THREE.Vector3() },
+        uRes: { value: new THREE.Vector2() },
+        uNear: { value: camera.near },
+        uFar: { value: camera.far }
+      },
+      vertexShader: /* glsl */`
+        uniform float uTime;
+        uniform vec4 uSwellA[4];
+        uniform vec4 uSwellB[4];
+        uniform mat4 uMirrorMatrix;
+        varying vec3 vWorld;
+        varying vec4 vMirror;
+        varying vec2 vSwellSlope;
+        varying float vViewZ;
+        void main() {
+          vec3 p = (modelMatrix * vec4(position, 1.0)).xyz;
+          vec2 xz = p.xz;
+          float fade = 1.0 - smoothstep(1500.0, 6000.0, length(xz));
+          vec3 disp = vec3(0.0);
+          vec2 slope = vec2(0.0);
+          for (int i = 0; i < 4; i++) {
+            vec4 a = uSwellA[i]; vec4 b = uSwellB[i];
+            float th = a.z * dot(a.xy, xz) - b.x * uTime + b.y;
+            float s = sin(th), c = cos(th);
+            disp.xz += b.z * a.w * a.xy * c;
+            disp.y += a.w * s;
+            slope += a.xy * (a.w * a.z * c);
+          }
+          p += disp * fade;
+          vSwellSlope = slope * fade;
+          vWorld = p;
+          vMirror = uMirrorMatrix * vec4(xz.x, 0.0, xz.y, 1.0);
+          vec4 mv = viewMatrix * vec4(p, 1.0);
+          vViewZ = -mv.z;
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        precision highp sampler3D;
+        #include <packing>
+        #define DETAIL ${DETAIL}
+        #define DUCKS ${DUCKS}
+        uniform float uTime, uSunVis, uNear, uFar;
+        uniform vec4 uDetA[DETAIL];
+        uniform vec4 uDetB[DETAIL];
+        uniform vec4 uDuckA[DUCKS];
+        uniform vec4 uDuckB[DUCKS];
+        uniform sampler2D tRefl, tRefr, tRefrDepth;
+        uniform samplerCube uSky;
+        uniform sampler3D uNoise;
+        uniform vec3 uSun, uSunE, uAmb;
+        uniform vec2 uRes;
+        varying vec3 vWorld;
+        varying vec4 vMirror;
+        varying vec2 vSwellSlope;
+        varying float vViewZ;
+
+        float D_GGX(float NH, float a2) { float d = NH * NH * (a2 - 1.0) + 1.0; return a2 / (3.14159 * d * d); }
+        float V_Smith(float NV, float NL, float a2) {
+          float gv = NL * sqrt(NV * NV * (1.0 - a2) + a2);
+          float gl = NV * sqrt(NL * NL * (1.0 - a2) + a2);
+          return 0.5 / max(gv + gl, 1e-5);
+        }
+
+        void main() {
+          vec2 xz = vWorld.xz;
+          vec3 toCam = cameraPosition - vWorld;
+          float dist = length(toCam);
+          vec3 V = toCam / dist;
+
+          // ---- filtered capillary / wind-wave detail
+          vec2 fw = fwidth(xz);
+          float fp = max(max(fw.x, fw.y), 1e-3);
+          float gust = texture(uNoise, vec3(xz * 0.0011 + vec2(uTime * 0.0022, uTime * 0.0013), 0.13 + uTime * 0.0007)).r;
+          gust = 0.35 + 1.35 * smoothstep(0.15, 0.85, gust);
+          vec2 slope = vSwellSlope;
+          float variance = 0.0;
+          for (int i = 0; i < DETAIL; i++) {
+            vec4 a = uDetA[i]; vec4 b = uDetB[i];
+            float wl = 6.2831853 / a.z;
+            float w = clamp(wl / (fp * 3.0) - 1.0, 0.0, 1.0);
+            float s = a.w * a.z * gust;
+            variance += (1.0 - w * w) * 0.5 * s * s;
+            if (w > 0.0) {
+              float ph = a.z * dot(a.xy, xz) - b.x * uTime + b.y;
+              slope += a.xy * (s * w * cos(ph));
+            }
+          }
+
+          // ---- ripples shed by the bobbing ducks, plus contact shading
+          float contact = 0.0;
+          for (int j = 0; j < DUCKS; j++) {
+            vec4 d = uDuckA[j];
+            vec2 rel = xz - d.xy;
+            float r2 = dot(rel, rel);
+            float R = 3.4 * d.w;
+            if (r2 > (R + 30.0) * (R + 30.0)) continue;
+            float c = cos(d.z), s = sin(d.z);
+            vec2 loc = vec2(rel.x * c - rel.y * s, rel.x * s + rel.y * c) / d.w;
+            float e = length(loc / vec2(2.55, 3.25));
+            float edge = (e - 1.0) * 2.9 * d.w;
+            if (edge < -0.5) continue;
+            edge = max(edge, 0.0);
+            vec4 db = uDuckB[j];
+            float amp = (0.05 + 0.35 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 9.0);
+            float ph = edge * 1.6 - uTime * 4.2 + db.y;
+            vec2 radial = rel / max(sqrt(r2), 1e-3);
+            slope += radial * amp * cos(ph) * smoothstep(0.0, 0.6, edge);
+            contact += exp(-edge / 1.1);
+          }
+
+          vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
+          float NV = max(dot(N, V), 1e-3);
+          float a2 = clamp(0.0012 + 2.0 * variance, 0.0012, 0.4);
+
+          // ---- planar reflection (ducks + sky), blurred by filtered roughness
+          vec2 muv = vMirror.xy / vMirror.w;
+          muv += N.xz * (0.9 / (1.0 + dist * 0.012)) * vec2(0.06, 0.08);
+          float lod = clamp(log2(1.0 + sqrt(a2) * 30.0), 0.0, 5.0);
+          vec3 refl = textureLod(tRefl, muv, lod).rgb;
+
+          // ---- refraction: submerged duck bellies through the water column
+          vec2 suv = gl_FragCoord.xy / uRes;
+          vec2 ruv = suv + N.xz * 0.025 / (1.0 + dist * 0.01);
+          float zs = -perspectiveDepthToViewZ(texture(tRefrDepth, ruv).x, uNear, uFar);
+          if (zs < vViewZ) { ruv = suv; zs = -perspectiveDepthToViewZ(texture(tRefrDepth, ruv).x, uNear, uFar); }
+          float thick = max(zs - vViewZ, 0.0) * dist / max(vViewZ, 1e-3);
+          vec3 trans = exp(-vec3(0.55, 0.16, 0.12) * thick);
+          vec3 scatter = vec3(0.004, 0.022, 0.020) * (uAmb * 2.2 + uSunE * 0.03);
+          vec3 under = texture(tRefr, ruv).rgb * trans + scatter * (1.0 - trans);
+
+          // ---- Fresnel blend
+          float F = 0.02 + 0.98 * pow(1.0 - NV, 5.0);
+          vec3 col = mix(under, refl, F);
+          col *= 1.0 - 0.35 * clamp(contact, 0.0, 1.0);
+
+          // ---- sun glitter (GGX with distance-filtered roughness)
+          vec3 L = uSun;
+          vec3 H = normalize(L + V);
+          float NL = max(dot(N, L), 0.0);
+          float NH = max(dot(N, H), 0.0);
+          float VH = max(dot(V, H), 0.0);
+          float Fs = 0.02 + 0.98 * pow(1.0 - VH, 5.0);
+          vec3 spec = uSunE * uSunVis * D_GGX(NH, a2) * V_Smith(NV, NL, a2) * Fs * NL;
+          col += min(spec, vec3(3000.0));
+
+          // ---- aerial perspective toward the horizon
+          float haze = 1.0 - exp(-dist * 0.00011);
+          vec3 hz = texture(uSky, normalize(vec3(-V.x, 0.004, -V.z))).rgb;
+          col = mix(col, hz, haze);
+
+          gl_FragColor = vec4(col, 1.0);
+        }`
+    });
+    const water = new THREE.Mesh(buildWaterGeometry(), waterMat);
+    water.frustumCulled = false;
+    scene.add(water);
+
+    // ------------------------------------------------------------------
+    //  Planar mirror camera (oblique clip plane, same idea as Reflector)
+    // ------------------------------------------------------------------
+    const mirrorCam = new THREE.PerspectiveCamera();
+    const MIRROR_Y = -0.25;
+    const _n = new THREE.Vector3(0, 1, 0), _rp = new THREE.Vector3(0, MIRROR_Y, 0);
+    const _cwp = new THREE.Vector3(), _rot = new THREE.Matrix4(), _look = new THREE.Vector3(), _view = new THREE.Vector3(), _tgt = new THREE.Vector3();
+    const _plane = new THREE.Plane(), _clip = new THREE.Vector4(), _q = new THREE.Vector4();
+    function updateMirror() {
+      _cwp.setFromMatrixPosition(camera.matrixWorld);
+      _view.subVectors(_rp, _cwp).reflect(_n).negate().add(_rp);
+      _rot.extractRotation(camera.matrixWorld);
+      _look.set(0, 0, -1).applyMatrix4(_rot).add(_cwp);
+      _tgt.subVectors(_rp, _look).reflect(_n).negate().add(_rp);
+      mirrorCam.position.copy(_view);
+      mirrorCam.up.set(0, 1, 0).applyMatrix4(_rot).reflect(_n);
+      mirrorCam.lookAt(_tgt);
+      mirrorCam.far = camera.far; mirrorCam.near = camera.near;
+      mirrorCam.updateMatrixWorld();
+      mirrorCam.projectionMatrix.copy(camera.projectionMatrix);
+      mirrorTexMatrix.set(0.5, 0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0, 0.5, 0.5, 0, 0, 0, 1);
+      mirrorTexMatrix.multiply(mirrorCam.projectionMatrix).multiply(mirrorCam.matrixWorldInverse);
+      _plane.setFromNormalAndCoplanarPoint(_n, _rp).applyMatrix4(mirrorCam.matrixWorldInverse);
+      _clip.set(_plane.normal.x, _plane.normal.y, _plane.normal.z, _plane.constant);
+      const e = mirrorCam.projectionMatrix.elements;
+      _q.x = (Math.sign(_clip.x) + e[8]) / e[0];
+      _q.y = (Math.sign(_clip.y) + e[9]) / e[5];
+      _q.z = -1.0;
+      _q.w = (1.0 + e[10]) / e[14];
+      _clip.multiplyScalar(2.0 / _clip.dot(_q));
+      e[2] = _clip.x; e[6] = _clip.y; e[10] = _clip.z + 1.0; e[14] = _clip.w;
+      mirrorCam.projectionMatrixInverse.copy(mirrorCam.projectionMatrix).invert();
+    }
+
+    // ------------------------------------------------------------------
+    //  Post: depth of field -> bloom -> lens/film composite
+    // ------------------------------------------------------------------
+    const dofMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tColor: { value: null }, tDepth: { value: null },
+        uNear: { value: camera.near }, uFar: { value: camera.far },
+        uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 },
+        uRes: { value: new THREE.Vector2() }, uExposure: { value: params.has('ev') ? parseFloat(params.get('ev')) : 0.72 }
+      },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: /* glsl */`
+        #include <packing>
+        varying vec2 vUv;
+        uniform sampler2D tColor, tDepth;
+        uniform float uNear, uFar, uFocus, uAperture, uMaxCoc, uExposure;
+        uniform vec2 uRes;
+        float lin(vec2 uv) { return -perspectiveDepthToViewZ(texture(tDepth, uv).x, uNear, uFar); }
+        float coc(float z) { return min(uAperture * abs(z - uFocus) / max(z, 1e-3), uMaxCoc); }
+        void main() {
+          float zc = lin(vUv);
+          float cc = coc(zc);
+          vec3 acc = texture(tColor, vUv).rgb;
+          float wsum = 1.0;
+          const int N = 40;
+          for (int i = 0; i < N; i++) {
+            float fi = float(i) + 0.5;
+            float r = sqrt(fi / float(N)) * uMaxCoc;
+            float th = fi * 2.39996323;
+            vec2 o = vec2(cos(th), sin(th)) * r;
+            vec2 uv = vUv + o / uRes;
+            float zs = lin(uv);
+            float cs = coc(zs);
+            if (zs > zc) cs = min(cs, cc * 1.5 + 0.5);
+            float w = smoothstep(r - 1.0, r + 0.5, cs);
+            vec3 s = texture(tColor, uv).rgb;
+            // bokeh: favour bright taps a little so highlights bloom into discs
+            w *= 1.0 + 0.25 * min(dot(s, vec3(0.3, 0.6, 0.1)), 20.0) * step(1.5, cs);
+            acc += s * w; wsum += w;
+          }
+          gl_FragColor = vec4(acc / wsum * uExposure, 1.0);
+        }`
+    });
+    const dofQuad = new FullScreenQuad(dofMat);
+
+    const compMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tColor: { value: null }, uTime: { value: 0 }, uRes: { value: new THREE.Vector2() },
+        uSunUV: { value: new THREE.Vector2() }, uSunVis: { value: 0 }, uSunCol: { value: new THREE.Vector3() }
+      },
+      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      fragmentShader: /* glsl */`
+        varying vec2 vUv;
+        uniform sampler2D tColor;
+        uniform float uTime, uSunVis;
+        uniform vec2 uRes, uSunUV;
+        uniform vec3 uSunCol;
+        float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+        void main() {
+          vec2 uv = vUv;
+          vec2 c = uv - 0.5;
+          float aspect = uRes.x / uRes.y;
+          // gentle barrel distortion + lateral chromatic aberration
+          float r2 = dot(c * vec2(aspect, 1.0), c * vec2(aspect, 1.0));
+          vec2 duv = c * (1.0 + 0.018 * r2);
+          vec2 ca = duv * 0.0028 * r2;
+          vec3 col;
+          col.r = texture(tColor, 0.5 + duv - ca).r;
+          col.g = texture(tColor, 0.5 + duv).g;
+          col.b = texture(tColor, 0.5 + duv + ca).b;
+
+          // lens ghosts from the sun
+          if (uSunVis > 0.001) {
+            vec2 axis = vec2(0.5) - uSunUV;
+            vec3 g = vec3(0.0);
+            float k[6] = float[6](0.35, 0.62, 0.9, 1.25, 1.55, 1.85);
+            float sz[6] = float[6](0.018, 0.04, 0.012, 0.07, 0.03, 0.11);
+            vec3 tint[6] = vec3[6](vec3(0.9,0.6,0.3), vec3(0.3,0.6,0.9), vec3(1.0,0.8,0.5), vec3(0.4,0.9,0.6), vec3(0.9,0.5,0.8), vec3(0.5,0.6,1.0));
+            for (int i = 0; i < 6; i++) {
+              vec2 gp = uSunUV + axis * k[i] * 2.0;
+              float d = length((uv - gp) * vec2(aspect, 1.0));
+              g += tint[i] * smoothstep(sz[i], sz[i] * 0.55, d) * 0.5;
+            }
+            float hd = length((uv - (uSunUV + axis * 2.0)) * vec2(aspect, 1.0));
+            g += vec3(0.6, 0.7, 1.0) * smoothstep(0.02, 0.0, abs(hd - 0.32)) * 0.25;
+            col += g * uSunCol * uSunVis * 0.004;
+          }
+
+          // vignette (natural cos^4-ish falloff)
+          float vig = pow(clamp(1.0 - r2 * 0.32, 0.0, 1.0), 2.0);
+          col *= vig;
+
+          gl_FragColor = vec4(col, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+
+          // film grain (luma weighted, temporal)
+          float n = hash(gl_FragCoord.xy + fract(uTime * 7.31) * 1000.0) + hash(gl_FragCoord.xy * 1.7 + fract(uTime * 3.17) * 500.0) - 1.0;
+          float l = dot(gl_FragColor.rgb, vec3(0.299, 0.587, 0.114));
+          gl_FragColor.rgb += n * mix(0.035, 0.012, l);
+        }`
+    });
+    const compQuad = new FullScreenQuad(compMat);
+
+    // ------------------------------------------------------------------
+    //  Email overlay (identical to the original page)
+    // ------------------------------------------------------------------
+    {
+      const dotCanvas = document.createElement('canvas'); dotCanvas.width = 700; dotCanvas.height = 80;
+      const dotCtx = dotCanvas.getContext('2d');
+      const tmp = document.createElement('canvas'); tmp.width = 700; tmp.height = 80;
+      const tctx = tmp.getContext('2d');
+      tctx.fillStyle = 'white'; tctx.font = 'bold 42px monospace'; tctx.textAlign = 'right'; tctx.textBaseline = 'middle';
+      tctx.fillText('andrew@fursman.com', 692, 40);
+      const data = tctx.getImageData(0, 0, 700, 80).data;
+      dotCtx.fillStyle = 'white';
+      for (let y = 0; y < 80; y += 4) for (let x = 0; x < 700; x += 4) {
+        if (data[(y * 700 + x) * 4 + 3] > 128) { dotCtx.beginPath(); dotCtx.arc(x + 2, y + 2, 2, 0, Math.PI * 2); dotCtx.fill(); }
+      }
+      const overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;bottom:4px;right:8px;pointer-events:none;opacity:0.7;z-index:1;';
+      const img = document.createElement('img'); img.src = dotCanvas.toDataURL(); img.style.cssText = 'height:56px;';
+      overlay.appendChild(img); document.body.appendChild(overlay);
+    }
+
+    // ------------------------------------------------------------------
+    //  Lighting state (recomputed from the atmosphere model)
+    // ------------------------------------------------------------------
+    const sunE = new THREE.Vector3(), sunCloud = new THREE.Vector3(), amb = new THREE.Vector3();
+    const BASE_EV = params.has('ev') ? parseFloat(params.get('ev')) : 0.72;
+    const REF_SUN_LUM = SUN_E * jSunT([0, A.PR + 0.01, 0], [0, Math.sin(THREE.MathUtils.degToRad(0.5)), -Math.cos(THREE.MathUtils.degToRad(0.5))])[0];
+    function updateLighting() {
+      const L = [sunDir.x, sunDir.y, sunDir.z];
+      const tg = jSunT([0, A.PR + 0.01, 0], L);
+      const tc = jSunT([0, A.PR + 2.0, 0], L);
+      sunE.set(tg[0], tg[1], tg[2]).multiplyScalar(SUN_E);
+      sunCloud.set(tc[0], tc[1], tc[2]).multiplyScalar(SUN_E);
+      const th = jSunT([0, A.PR + 7.5, 0], L);
+      skyCubeMat.uniforms.uSunHigh.value.set(th[0], th[1], th[2]).multiplyScalar(SUN_E);
+      // average sky radiance over the upper hemisphere
+      const acc = [0, 0, 0]; let n = 0;
+      for (const el of [0.08, 0.35, 0.8]) for (let a = 0; a < 6; a++) {
+        const az = a / 6 * Math.PI * 2, ce = Math.cos(el);
+        const s = jSky([Math.cos(az) * ce, Math.sin(el), Math.sin(az) * ce], L);
+        acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2]; n++;
+      }
+      amb.set(acc[0] / n, acc[1] / n, acc[2] / n);
+      skyCubeMat.uniforms.uSunCloud.value.copy(sunCloud);
+      skyCubeMat.uniforms.uAmb.value.copy(amb);
+      waterMat.uniforms.uSunE.value.copy(sunE);
+      waterMat.uniforms.uAmb.value.copy(amb);
+      const lum = Math.max(sunE.x, sunE.y, sunE.z);
+      sunLight.color.setRGB(sunE.x / lum, sunE.y / lum, sunE.z / lum, THREE.LinearSRGBColorSpace);
+      sunLight.intensity = lum;
+      const omega = 2 * Math.PI * (1 - Math.cos(SUN_ANG));
+      skyDomeMat.uniforms.uSunDisk.value.copy(sunE).multiplyScalar(1 / omega).clampScalar(0, 40000);
+      if (vinyl.userData.shader) vinyl.userData.shader.uniforms.uSunColV.value.copy(sunE);
+      compMat.uniforms.uSunCol.value.copy(sunE);
+      // exposure compensation if the sun is moved off its default height (?sun=)
+      dofMat.uniforms.uExposure.value = BASE_EV * Math.pow(REF_SUN_LUM / Math.max(lum, 1e-3), 0.75);
+    }
+    function setSun() {
+      sunDir.setFromSphericalCoords(1, Math.PI / 2 - SUN_ELEV, sunTheta);
+      skyCubeMat.uniforms.uSun.value.copy(sunDir);
+    }
+    setSun();
+    updateLighting();
+
+    // prime the cubemap + environment
+    for (let i = 0; i < 6; i++) renderCubeFace(i);
+    rebuildEnv();
+
+    // ------------------------------------------------------------------
+    //  Simulation
+    // ------------------------------------------------------------------
+    let hasInteracted = false;
+    let autoPanAngle = Math.PI * 0.5;
+    setTimeout(() => {
+      ['mousemove', 'mousedown', 'touchstart', 'wheel'].forEach(evt =>
+        renderer.domElement.addEventListener(evt, () => { hasInteracted = true; }, { once: true }));
+    }, 2000);
+
+    const _m = new THREE.Matrix4(), _p = new THREE.Vector3(), _s = new THREE.Vector3(), _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _up = new THREE.Vector3(0, 1, 0), _nrm = new THREE.Vector3();
+    function updateDucks(t, dt) {
+      const f = dt * 60;
+      for (let i = 0; i < DUCKS; i++) {
+        const d = ducks[i];
+        d.x += d.driftX * f; d.z += d.driftZ * f;
+        if (Math.abs(d.x) > 80) { d.driftX *= -1; d.x = Math.sign(d.x) * 80; }
+        if (Math.abs(d.z) > 80) { d.driftZ *= -1; d.z = Math.sign(d.z) * 80; }
+        d.yaw += d.rotateSpeed * f;
+        for (let j = i + 1; j < DUCKS; j++) {
+          const o = ducks[j];
+          const dx = d.x - o.x, dz = d.z - o.z, distSq = dx * dx + dz * dz;
+          const minDist = 2.8 * d.s + 2.8 * o.s;
+          if (distSq < minDist * minDist && distSq > 0.0001) {
+            const dist = Math.sqrt(distSq), force = (minDist - dist) * 0.02 * f;
+            d.driftX += dx / dist * force; d.driftZ += dz / dist * force;
+            o.driftX -= dx / dist * force; o.driftZ -= dz / dist * force;
+            const lim = 0.15;
+            d.driftX = THREE.MathUtils.clamp(d.driftX, -lim, lim); d.driftZ = THREE.MathUtils.clamp(d.driftZ, -lim, lim);
+            o.driftX = THREE.MathUtils.clamp(o.driftX, -lim, lim); o.driftZ = THREE.MathUtils.clamp(o.driftZ, -lim, lim);
+          }
+        }
+        // buoyancy: damped spring toward the local surface
+        const target = waveHeight(d.x, d.z, t) + 0.5 * d.s;
+        d.vy += ((target - d.y) * 7.0 - d.vy * 2.6) * dt;
+        d.y += d.vy * dt;
+        const [sx, sz] = waveSlope(d.x, d.z, t);
+        const k = 1 - Math.exp(-dt * 2.5);
+        d.tx += (sx - d.tx) * k; d.tz += (sz - d.tz) * k;
+        const wob = 0.012 * Math.sin(t * 1.3 + d.wob);
+        _nrm.set(-d.tx * 0.85 + wob, 1, -d.tz * 0.85 + 0.6 * wob).normalize();
+        _qa.setFromUnitVectors(_up, _nrm);
+        _qb.setFromAxisAngle(_up, d.yaw);
+        _qa.multiply(_qb);
+        _m.compose(_p.set(d.x, d.y, d.z), _qa, _s.setScalar(d.s));
+        duckMesh.setMatrixAt(i, _m);
+        eyeMesh.setMatrixAt(i, _m);
+        waterMat.uniforms.uDuckA.value[i].set(d.x, d.z, d.yaw, d.s);
+        waterMat.uniforms.uDuckB.value[i].set(d.vy, d.wob * 3.0, 0, 0);
+      }
+      duckMesh.instanceMatrix.needsUpdate = true;
+      eyeMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    // smooth value noise for a hand-held camera feel
+    const shake = (t, s) => Math.sin(t * 0.71 + s) * 0.5 + Math.sin(t * 1.37 + s * 2.1) * 0.3 + Math.sin(t * 2.93 + s * 3.7) * 0.2;
+
+    // ------------------------------------------------------------------
+    //  Frame
+    // ------------------------------------------------------------------
+    const clock = new THREE.Clock();
+    let simTime = 0, lastEnv = 0, lastLight = 0, focus = 100;
+    let frames = 0, ftAcc = 0, lastAdapt = 0, started = false;
+    const _sp = new THREE.Vector3();
+
+    function frame(fixedDt) {
+      if (!CAPTURE) requestAnimationFrame(frame);
+      const dt = CAPTURE ? fixedDt : Math.min(clock.getDelta(), 0.1);
+      simTime += dt;
+      const t = simTime;
+
+      // sun drifts exactly like the original (per-frame rate converted to seconds)
+      sunTheta += 0.000035 * 60 * dt;
+      setSun();
+      if (t - lastLight > 0.5) { updateLighting(); lastLight = t; }
+
+      updateDucks(t, dt);
+
+      // camera: same kiosk auto-pan as the original, plus a hint of hand-held motion
+      if (!hasInteracted) {
+        autoPanAngle += 0.000133 * 60 * dt;
+        camera.position.set(Math.cos(autoPanAngle) * 100, 25 + Math.sin(autoPanAngle * 0.3) * 8, Math.sin(autoPanAngle) * 100);
+        controls.target.set(0, 10, 0);
+      }
+      controls.update();
+      camera.rotateX(shake(t, 1.0) * 0.0018);
+      camera.rotateY(shake(t, 4.0) * 0.0024);
+      camera.rotateZ(shake(t, 9.0) * 0.0012);
+      camera.updateMatrixWorld();
+
+      // sun shadow frustum follows the duck pond
+      sunLight.position.copy(sunDir).multiplyScalar(350);
+      sunLight.target.position.set(0, 0, 0);
+      sunLight.target.updateMatrixWorld();
+
+      // 1. sky/cloud cubemap: one face per frame; refresh image-based lighting periodically
+      skyCubeMat.uniforms.uTime.value = t;
+      renderCubeFace(cubeFace);
+      cubeFace = (cubeFace + 1) % 6;
+      if (t - lastEnv > 2.0 && cubeFace === 0) { rebuildEnv(); lastEnv = t; }
+
+      // 2. reflection
+      waterMat.uniforms.uTime.value = t;
+      updateMirror();
+      water.visible = false;
+      skyDomeMat.uniforms.uNoSun.value = 1;
+      renderer.shadowMap.needsUpdate = true;
+      renderer.setRenderTarget(reflRT);
+      renderer.render(scene, mirrorCam);
+
+      // 3. refraction (ducks only)
+      camera.layers.set(1);
+      renderer.setClearColor(0x000000, 0);
+      renderer.setRenderTarget(refrRT);
+      renderer.clear();
+      renderer.render(scene, camera);
+      camera.layers.set(0);
+      renderer.setClearColor(0x000000, 1);
+      water.visible = true;
+      skyDomeMat.uniforms.uNoSun.value = 0;
+
+      // 4. main HDR pass
+      renderer.getDrawingBufferSize(size);
+      waterMat.uniforms.tRefl.value = reflRT.texture;
+      waterMat.uniforms.tRefr.value = refrRT.texture;
+      waterMat.uniforms.tRefrDepth.value = refrRT.depthTexture;
+      waterMat.uniforms.uRes.value.copy(size);
+      // sun visibility through clouds (for the glitter path and lens flare)
+      renderer.setRenderTarget(sceneRT);
+      renderer.render(scene, camera);
+
+      // 5. depth of field with a slow "autofocus" on the duck flock
+      const want = camera.position.distanceTo(controls.target);
+      focus = CAPTURE ? want : focus + (want - focus) * (1 - Math.exp(-dt * 2.0));
+      const res = size.y / 1080;
+      dofMat.uniforms.tColor.value = sceneRT.texture;
+      dofMat.uniforms.tDepth.value = sceneRT.depthTexture;
+      dofMat.uniforms.uFocus.value = focus;
+      dofMat.uniforms.uAperture.value = 2.6 * res;
+      dofMat.uniforms.uMaxCoc.value = Math.max(1.0, 6.5 * res);
+      dofMat.uniforms.uRes.value.copy(size);
+      renderer.setRenderTarget(dofRT);
+      dofQuad.render(renderer);
+
+      // 6. bloom (adds into dofRT)
+      bloom.render(renderer, null, dofRT, dt, false);
+
+      // 7. lens + film composite to screen
+      _sp.copy(sunDir).multiplyScalar(1000).add(camera.position).project(camera);
+      const onScreen = _sp.z < 1 && Math.abs(_sp.x) < 1.2 && Math.abs(_sp.y) < 1.2;
+      compMat.uniforms.uSunUV.value.set(_sp.x * 0.5 + 0.5, _sp.y * 0.5 + 0.5);
+      compMat.uniforms.uSunVis.value = onScreen ? (1 - Math.max(Math.abs(_sp.x), Math.abs(_sp.y)) / 1.2) : 0;
+      compMat.uniforms.uTime.value = t;
+      compMat.uniforms.tColor.value = dofRT.texture;
+      compMat.uniforms.uRes.value.copy(size);
+      renderer.setRenderTarget(null);
+      compQuad.render(renderer);
+
+      if (!started) { started = true; requestAnimationFrame(() => document.getElementById('curtain').classList.add('gone')); }
+
+      // adaptive resolution
+      if (adaptive && !CAPTURE) {
+        frames++; ftAcc += dt;
+        if (t - lastAdapt > 3 && frames > 20) {
+          const avg = ftAcc / frames;
+          let next = renderScale;
+          if (avg > 1 / 40 && renderScale > 0.5) next = Math.max(0.5, renderScale - 0.15);
+          else if (avg < 1 / 75 && renderScale < 1) next = Math.min(1, renderScale + 0.1);
+          if (next !== renderScale) { renderScale = next; resize(); }
+          frames = 0; ftAcc = 0; lastAdapt = t;
+        }
+      }
+    }
+
+    function resize() {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setPixelRatio(pixelRatio());
+      renderer.setSize(innerWidth, innerHeight);
+      allocTargets();
+    }
+    addEventListener('resize', resize);
+    document.addEventListener('visibilitychange', () => clock.getDelta());
+
+    if (CAPTURE) {
+      window.__frame = (dt, n = 1) => { for (let i = 0; i < n; i++) frame(dt); return true; };
+      window.__setTime = (t) => { simTime = t; };
+      window.__setPan = (a) => { autoPanAngle = a; };
+      window.__view = (p, t) => { hasInteracted = true; camera.position.set(...p); controls.target.set(...t); };
+      window.__ducks = ducks; window.__controls = controls;
+      window.__setSun = (th) => { sunTheta = th; };
+      window.__dbg = { renderCubeFace, rebuildEnv, THREE, renderer, scene, camera, skyDome, water, skyDomeMat, mirrorCam, cubeRT, reflRT: () => reflRT, sceneRT: () => sceneRT, skyCubeMat, waterMat, cubeCam, sunDir, amb, sunE };
+      window.__ready = true;
+    } else frame();
+  </script>
+</body>
+</html>
