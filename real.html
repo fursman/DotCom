@@ -562,7 +562,7 @@
           const d = (kx * wx + kz * wz) / k;
           const dir = d * d * (d < 0 ? 0.3 : 1.0);
           // Phillips spectrum with a soft capillary cutoff
-          const P = Math.exp(-1 / (k * Lw) ** 2) / k ** 4 * dir * Math.exp(-(k * 0.08) ** 2);
+          const P = Math.exp(-1 / ((k * Lw) ** 2)) / k ** 4 * dir * Math.exp(-((k * 0.08) ** 2));
           const dk = (2 * Math.PI / c.L) ** 2;
           const a = Math.sqrt(P * dk / 2);
           data[i] = gauss() * a; data[i + 1] = gauss() * a;
