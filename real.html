@@ -534,9 +534,10 @@
       const f = i / (DETAIL - 1);
       const wl = 42 * Math.pow(0.55 / 42, f);
       const k = 2 * Math.PI / wl;
-      const spread = 0.5 + 1.1 * f;
+      const spread = 0.9 + 1.2 * f;
       const a = windAng + (rand() * 2 - 1) * spread;
-      const slope = 0.019 * (0.6 + 0.4 * Math.sin(f * 3.1)) * (0.75 + 0.5 * rand());
+      // long components kept gentle: their straight parallel crests are what read as 'scanlines'
+      const slope = 0.019 * (0.35 + 0.65 * Math.min(1, f * 2.2)) * (0.75 + 0.5 * rand());
       detail.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp: slope / k, w: Math.sqrt(GRAV * k + 2.5 * k * k * k), ph: rand() * 6.283 });
     }
     function waveHeight(x, z, t) {
@@ -1016,16 +1017,21 @@
           float fp = max(max(fw.x, fw.y), 1e-3);
           float gust = texture(uNoise, vec3(xz * 0.0011 + vec2(uTime * 0.0022, uTime * 0.0013), 0.13 + uTime * 0.0007)).r;
           gust = 0.35 + 1.35 * smoothstep(0.15, 0.85, gust);
+          // smooth warp field: bends wave crests so the sum of sines never lines up into stripes
+          vec2 wq = xz * 0.017 + vec2(uTime * 0.010, -uTime * 0.007);
+          vec2 warp = vec2(texture(uNoise, vec3(wq, 0.31)).r, texture(uNoise, vec3(wq + 0.37, 0.67)).r) * 2.0 - 1.0;
+          vec2 xzw = xz + warp * 3.5;
           vec2 slope = vSwellSlope;
           float variance = 0.0;
           for (int i = 0; i < DETAIL; i++) {
             vec4 a = uDetA[i]; vec4 b = uDetB[i];
             float wl = 6.2831853 / a.z;
-            float w = clamp(wl / (fp * 3.0) - 1.0, 0.0, 1.0);
+            float w = clamp(wl / (fp * 4.0) - 1.0, 0.0, 1.0);
             float s = a.w * a.z * gust;
             variance += (1.0 - w * w) * 0.5 * s * s;
             if (w > 0.0) {
-              float ph = a.z * dot(a.xy, xz) - b.x * uTime + b.y;
+              float fi = float(i);
+              float ph = a.z * dot(a.xy, xzw) - b.x * uTime + b.y + (warp.x * cos(fi * 2.3) + warp.y * sin(fi * 2.3)) * 1.6;
               slope += a.xy * (s * w * cos(ph));
             }
           }
@@ -1037,7 +1043,7 @@
             vec2 rel = xz - d.xy;
             float r2 = dot(rel, rel);
             float R = 3.4 * d.w;
-            if (r2 > (R + 12.0) * (R + 12.0)) continue;
+            if (r2 > (R + 18.0) * (R + 18.0)) continue;
             float c = cos(d.z), s = sin(d.z);
             vec2 loc = vec2(rel.x * c - rel.y * s, rel.x * s + rel.y * c) / d.w;
             float e = length(loc / vec2(2.55, 3.25));
@@ -1046,8 +1052,8 @@
             edge = max(edge, 0.0);
             vec4 db = uDuckB[j];
             // kept faint and short-lived so the wind texture on the water stays dominant
-            float amp = (0.006 + 0.03 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 2.5);
-            float ph = edge * 1.6 - uTime * 4.2 + db.y;
+            float amp = (0.014 + 0.07 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 4.5);
+            float ph = edge * 1.5 - uTime * 3.6 + db.y + warp.x * 1.5;
             vec2 radial = rel / max(sqrt(r2), 1e-3);
             slope += radial * amp * cos(ph) * smoothstep(0.0, 0.6, edge);
             contact += exp(-edge / 1.1);
