@@ -528,18 +528,141 @@
       const k = 2 * Math.PI / wl, a = windAng + da;
       swell.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp, w: Math.sqrt(GRAV * k), ph: rand() * 6.283, q: 0.35 });
     });
-    const DETAIL = 32;
-    const detail = [];
-    for (let i = 0; i < DETAIL; i++) {
-      const f = i / (DETAIL - 1);
-      const wl = 42 * Math.pow(0.55 / 42, f);
-      const k = 2 * Math.PI / wl;
-      const spread = 0.9 + 1.2 * f;
-      const a = windAng + (rand() * 2 - 1) * spread;
-      // long components kept gentle: their straight parallel crests are what read as 'scanlines'
-      const slope = 0.019 * (0.35 + 0.65 * Math.min(1, f * 2.2)) * (0.75 + 0.5 * rand());
-      detail.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp: slope / k, w: Math.sqrt(GRAV * k + 2.5 * k * k * k), ph: rand() * 6.283 });
+    // ------------------------------------------------------------------
+    //  Wind waves: GPU FFT ocean (Tessendorf). A directional wind spectrum is
+    //  evolved with the dispersion relation and inverse-FFT'd every frame into
+    //  slope maps. Three cascades at non-integer size ratios (and rotated) cover
+    //  wavelengths from ~60 units down to ~0.3 without visible tiling. The maps
+    //  store (sx, sz, sx^2, sz^2) and are mipmapped, so distant water averages
+    //  slopes and keeps their variance as roughness (correct sun glitter).
+    // ------------------------------------------------------------------
+    const FFT_N = 128, FFT_LOG = 7;
+    const floatRT = renderer.extensions.has('EXT_color_buffer_float');
+    const CASCADES = [
+      { L: 377, band: [12.0, 60.0], rot: 0.0 },
+      { L: 61.3, band: [1.9, 12.0], rot: 0.71 },
+      { L: 9.7, band: [0.3, 1.9], rot: 1.93 }
+    ];
+    const WIND_SPEED = 9.0;
+    const gauss = () => { const u = Math.max(rand(), 1e-9), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    {
+      const Lw = WIND_SPEED * WIND_SPEED / GRAV;
+      const wx = Math.cos(windAng), wz = Math.sin(windAng);
+      let slopeVar = 0;
+      for (const c of CASCADES) {
+        const data = new Float32Array(FFT_N * FFT_N * 4);
+        for (let m = 0; m < FFT_N; m++) for (let n = 0; n < FFT_N; n++) {
+          const kx = 2 * Math.PI * (n < FFT_N / 2 ? n : n - FFT_N) / c.L;
+          const kz = 2 * Math.PI * (m < FFT_N / 2 ? m : m - FFT_N) / c.L;
+          const k = Math.hypot(kx, kz);
+          const i = (m * FFT_N + n) * 4;
+          if (k < 1e-6) continue;
+          const wl = 2 * Math.PI / k;
+          if (wl < c.band[0] || wl >= c.band[1]) continue;
+          const d = (kx * wx + kz * wz) / k;
+          const dir = d * d * (d < 0 ? 0.3 : 1.0);
+          // Phillips spectrum with a soft capillary cutoff
+          const P = Math.exp(-1 / ((k * Lw) ** 2)) / k ** 4 * dir * Math.exp(-((k * 0.08) ** 2));
+          const dk = (2 * Math.PI / c.L) ** 2;
+          const a = Math.sqrt(P * dk / 2);
+          data[i] = gauss() * a; data[i + 1] = gauss() * a;
+          slopeVar += 2 * k * k * (data[i] ** 2 + data[i + 1] ** 2);
+        }
+        c.h0data = data;
+      }
+      // normalise to a calm-sea rms slope
+      const TARGET_RMS = 0.075;
+      const sc = TARGET_RMS / Math.sqrt(slopeVar);
+      for (const c of CASCADES) {
+        for (let i = 0; i < c.h0data.length; i++) c.h0data[i] *= sc;
+        c.h0 = new THREE.DataTexture(c.h0data, FFT_N, FFT_N, THREE.RGBAFormat, THREE.FloatType);
+        c.h0.minFilter = c.h0.magFilter = THREE.NearestFilter;
+        c.h0.needsUpdate = true;
+      }
     }
+    const fftRT = () => new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false, generateMipmaps: false });
+    for (const c of CASCADES) {
+      c.ping = fftRT(); c.pong = fftRT();
+      c.out = new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, anisotropy: renderer.capabilities.getMaxAnisotropy() });
+    }
+    const fftVS = `void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+    const specMat = new THREE.ShaderMaterial({
+      uniforms: { tH0: { value: null }, uL: { value: 1 }, uTime: { value: 0 } },
+      vertexShader: fftVS,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        uniform sampler2D tH0; uniform float uL, uTime;
+        int bitrev(int v) { int r = 0; for (int i = 0; i < ${FFT_LOG}; i++) { r = (r << 1) | (v & 1); v >>= 1; } return r; }
+        vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          int n = bitrev(p.x), m = bitrev(p.y);   // write in bit-reversed order for the DIT passes
+          const int N = ${FFT_N};
+          vec2 h0 = texelFetch(tH0, ivec2(n, m), 0).xy;
+          vec2 h0m = texelFetch(tH0, ivec2((N - n) % N, (N - m) % N), 0).xy;
+          float kx = 6.2831853 * float(n < N / 2 ? n : n - N) / uL;
+          float kz = 6.2831853 * float(m < N / 2 ? m : m - N) / uL;
+          float k = length(vec2(kx, kz));
+          float w = sqrt(${GRAV.toFixed(1)} * k);
+          vec2 e = vec2(cos(w * uTime), sin(w * uTime));
+          vec2 hk = cmul(h0, e) + cmul(vec2(h0m.x, -h0m.y), vec2(e.x, -e.y));
+          // pack both slope spectra into one complex field: F = i kx h + i (i kz h)
+          vec2 F = cmul(hk, vec2(-kz, kx));
+          gl_FragColor = vec4(F, 0.0, 1.0);
+        }`
+    });
+    const bflyMat = new THREE.ShaderMaterial({
+      uniforms: { tIn: { value: null }, uSize: { value: 2 }, uHoriz: { value: 1 } },
+      vertexShader: fftVS,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        uniform sampler2D tIn; uniform int uSize, uHoriz;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          int i = uHoriz == 1 ? p.x : p.y;
+          int half_ = uSize / 2;
+          int pos = i % uSize;
+          int j = pos % half_;
+          int ia = i - pos + j, ib = ia + half_;
+          vec2 a = texelFetch(tIn, uHoriz == 1 ? ivec2(ia, p.y) : ivec2(p.x, ia), 0).xy;
+          vec2 b = texelFetch(tIn, uHoriz == 1 ? ivec2(ib, p.y) : ivec2(p.x, ib), 0).xy;
+          float ang = 6.2831853 * float(j) / float(uSize);
+          vec2 tw = vec2(cos(ang), sin(ang));
+          vec2 bt = vec2(b.x * tw.x - b.y * tw.y, b.x * tw.y + b.y * tw.x);
+          gl_FragColor = vec4(pos < half_ ? a + bt : a - bt, 0.0, 1.0);
+        }`
+    });
+    const assembleMat = new THREE.ShaderMaterial({
+      uniforms: { tIn: { value: null } },
+      vertexShader: fftVS,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        uniform sampler2D tIn;
+        void main() {
+          vec2 s = texelFetch(tIn, ivec2(gl_FragCoord.xy), 0).xy;
+          gl_FragColor = vec4(s, s * s);
+        }`
+    });
+    const fftQuad = new FullScreenQuad(null);
+    function updateOcean(t) {
+      for (const c of CASCADES) {
+        specMat.uniforms.tH0.value = c.h0; specMat.uniforms.uL.value = c.L; specMat.uniforms.uTime.value = t;
+        fftQuad.material = specMat;
+        renderer.setRenderTarget(c.ping); fftQuad.render(renderer);
+        let src = c.ping, dst = c.pong;
+        fftQuad.material = bflyMat;
+        for (const horiz of [1, 0]) for (let s = 1; s <= FFT_LOG; s++) {
+          bflyMat.uniforms.tIn.value = src.texture; bflyMat.uniforms.uSize.value = 1 << s; bflyMat.uniforms.uHoriz.value = horiz;
+          renderer.setRenderTarget(dst); fftQuad.render(renderer);
+          [src, dst] = [dst, src];
+        }
+        assembleMat.uniforms.tIn.value = src.texture;
+        fftQuad.material = assembleMat;
+        renderer.setRenderTarget(c.out); fftQuad.render(renderer);
+      }
+      renderer.setRenderTarget(null);
+    }
+
     function waveHeight(x, z, t) {
       let h = 0;
       for (const s of swell) h += s.amp * Math.sin(s.k * (s.dx * x + s.dz * z) - s.w * t + s.ph);
@@ -929,8 +1052,11 @@
         uTime: { value: 0 },
         uSwellA: { value: swell.map(s => new THREE.Vector4(s.dx, s.dz, s.k, s.amp)) },
         uSwellB: { value: swell.map(s => new THREE.Vector4(s.w, s.ph, s.q, 0)) },
-        uDetA: { value: detail.map(s => new THREE.Vector4(s.dx, s.dz, s.k, s.amp)) },
-        uDetB: { value: detail.map(s => new THREE.Vector4(s.w, s.ph, 0, 0)) },
+        tWave0: { value: CASCADES[0].out.texture },
+        tWave1: { value: CASCADES[1].out.texture },
+        tWave2: { value: CASCADES[2].out.texture },
+        uCasc: { value: new THREE.Vector3(...CASCADES.map(c => c.L)) },
+        uRot: { value: new THREE.Vector3(...CASCADES.map(c => c.rot)) },
         uDuckA: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
         uDuckB: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
         uMirrorMatrix: { value: mirrorTexMatrix },
@@ -982,11 +1108,10 @@
         precision highp float;
         precision highp sampler3D;
         #include <packing>
-        #define DETAIL ${DETAIL}
         #define DUCKS ${DUCKS}
         uniform float uTime, uSunVis, uNear, uFar;
-        uniform vec4 uDetA[DETAIL];
-        uniform vec4 uDetB[DETAIL];
+        uniform sampler2D tWave0, tWave1, tWave2;
+        uniform vec3 uCasc, uRot;
         uniform vec4 uDuckA[DUCKS];
         uniform vec4 uDuckB[DUCKS];
         uniform sampler2D tRefl, tRefr, tRefrDepth;
@@ -1012,29 +1137,26 @@
           float dist = length(toCam);
           vec3 V = toCam / dist;
 
-          // ---- filtered capillary / wind-wave detail
-          vec2 fw = fwidth(xz);
-          float fp = max(max(fw.x, fw.y), 1e-3);
+          // ---- wind waves from the FFT cascades (mip/aniso filtered, variance -> roughness)
           float gust = texture(uNoise, vec3(xz * 0.0011 + vec2(uTime * 0.0022, uTime * 0.0013), 0.13 + uTime * 0.0007)).r;
-          gust = 0.35 + 1.35 * smoothstep(0.15, 0.85, gust);
-          // smooth warp field: bends wave crests so the sum of sines never lines up into stripes
-          vec2 wq = xz * 0.017 + vec2(uTime * 0.010, -uTime * 0.007);
-          vec2 warp = vec2(texture(uNoise, vec3(wq, 0.31)).r, texture(uNoise, vec3(wq + 0.37, 0.67)).r) * 2.0 - 1.0;
-          vec2 xzw = xz + warp * 3.5;
-          vec2 slope = vSwellSlope;
+          gust = 0.45 + 1.2 * smoothstep(0.15, 0.85, gust);
+          vec2 ws = vec2(0.0);
           float variance = 0.0;
-          for (int i = 0; i < DETAIL; i++) {
-            vec4 a = uDetA[i]; vec4 b = uDetB[i];
-            float wl = 6.2831853 / a.z;
-            float w = clamp(wl / (fp * 4.0) - 1.0, 0.0, 1.0);
-            float s = a.w * a.z * gust;
-            variance += (1.0 - w * w) * 0.5 * s * s;
-            if (w > 0.0) {
-              float fi = float(i);
-              float ph = a.z * dot(a.xy, xzw) - b.x * uTime + b.y + (warp.x * cos(fi * 2.3) + warp.y * sin(fi * 2.3)) * 1.6;
-              slope += a.xy * (s * w * cos(ph));
-            }
+          {
+            vec4 c;
+            mat2 r;
+            r = mat2(cos(uRot.x), sin(uRot.x), -sin(uRot.x), cos(uRot.x));
+            c = texture(tWave0, (r * xz) / uCasc.x);
+            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
+            r = mat2(cos(uRot.y), sin(uRot.y), -sin(uRot.y), cos(uRot.y));
+            c = texture(tWave1, (r * xz) / uCasc.y);
+            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
+            r = mat2(cos(uRot.z), sin(uRot.z), -sin(uRot.z), cos(uRot.z));
+            c = texture(tWave2, (r * xz) / uCasc.z);
+            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
           }
+          vec2 slope = vSwellSlope + ws * gust;
+          variance *= gust * gust;
 
           // ---- ripples shed by the bobbing ducks, plus contact shading
           float contact = 0.0;
@@ -1053,7 +1175,7 @@
             vec4 db = uDuckB[j];
             // kept faint and short-lived so the wind texture on the water stays dominant
             float amp = (0.014 + 0.07 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 4.5);
-            float ph = edge * 1.5 - uTime * 3.6 + db.y + warp.x * 1.5;
+            float ph = edge * 1.5 - uTime * 3.6 + db.y;
             vec2 radial = rel / max(sqrt(r2), 1e-3);
             slope += radial * amp * cos(ph) * smoothstep(0.0, 0.6, edge);
             contact += exp(-edge / 1.1);
@@ -1061,7 +1183,7 @@
 
           vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
           float NV = max(dot(N, V), 1e-3);
-          float a2 = clamp(0.0012 + 2.0 * variance, 0.0012, 0.4);
+          float a2 = clamp(0.0012 + variance, 0.0012, 0.4);
 
           // ---- planar reflection (ducks + sky), blurred by filtered roughness
           vec2 muv = vMirror.xy / vMirror.w;
@@ -1467,6 +1589,7 @@
 
       // 2. reflection
       waterMat.uniforms.uTime.value = t;
+      updateOcean(t);
       updateMirror();
       water.visible = false;
       skyDomeMat.uniforms.uNoSun.value = 1;
