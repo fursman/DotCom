@@ -34,31 +34,82 @@
     import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 
     // ------------------------------------------------------------------
-    //  Setup & quality
+    //  Setup & quality tiers
+    //  ?q=low|med|high pins the tier, ?scale=<0.4..1> pins the render scale,
+    //  ?hud shows frame timings.
     // ------------------------------------------------------------------
     const params = new URLSearchParams(location.search);
-    const probe = document.createElement('canvas').getContext('webgl2');
-    if (!probe) { document.getElementById('nogl').style.display = 'flex'; throw new Error('no webgl2'); }
-
-    const isMobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 900;
-    const maxDpr = isMobile ? 1.25 : 1.75;
-    let renderScale = params.has('scale') ? parseFloat(params.get('scale')) : 1.0;
-    const adaptive = !params.has('scale');
-    const CUBE_SIZE = isMobile ? 256 : 512;
-
     const CAPTURE = params.has('capture');   // deterministic, on-demand frames (for screenshots)
-    // keep the HDR/MSAA buffers within a sane pixel budget on 4K / retina screens
-    const PIXEL_BUDGET = isMobile ? 1.6e6 : 3.7e6;
-    const pixelRatio = () => Math.min(devicePixelRatio, maxDpr, Math.sqrt(PIXEL_BUDGET / (innerWidth * innerHeight))) * renderScale;
+    const isMobile = matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 900;
+    let gpuName = '';
+    {
+      const probe = document.createElement('canvas').getContext('webgl2');
+      if (!probe) { document.getElementById('nogl').style.display = 'flex'; throw new Error('no webgl2'); }
+      try {
+        const e = probe.getExtension('WEBGL_debug_renderer_info');
+        gpuName = String(probe.getParameter(e ? e.UNMASKED_RENDERER_WEBGL : probe.RENDERER) || '');
+      } catch (err) { /* masked */ }
+      const lose = probe.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
+    }
+    // 0 = phones / integrated / software, 1 = unknown or mid-range, 2 = discrete & Apple silicon.
+    // This only picks the starting point: the governor below keeps adjusting to the measured frame time.
+    const TIER = (() => {
+      const named = { low: 0, med: 1, medium: 1, high: 2 }[params.get('q')];
+      if (named !== undefined) return named;
+      let t = 1;
+      if (isMobile || /swiftshader|llvmpipe|software|basic render|mali|adreno|powervr|videocore|vivante/i.test(gpuName)) t = 0;
+      else if (/nvidia|geforce|rtx|gtx|quadro|radeon\s*(\(tm\)\s*)?(rx|pro)|\barc\b|apple m\d/i.test(gpuName)) t = 2;
+      else if (/intel/i.test(gpuName) && !/iris|\bxe\b/i.test(gpuName)) t = 0;
+      try { const cap = sessionStorage.getItem('realTierCap'); if (cap !== null) t = Math.min(t, +cap); } catch (err) { /* private mode */ }
+      return t;
+    })();
+    const Q = [
+      { budget: 1.6e6, dpr: 1.25, msaa: 2, cube: 512, tile: 128, tiles: 1.0, steps: 36, shadow: [2048, 512], soft: false, aniso: 2, env: 128, duck: [40, 24], rip: 384, dof: 12 },
+      { budget: 2.6e6, dpr: 1.5, msaa: 4, cube: 768, tile: 192, tiles: 1.5, steps: 48, shadow: [2048, 512], soft: true, aniso: 4, env: 128, duck: [48, 26], rip: 512, dof: 16 },
+      { budget: 3.7e6, dpr: 1.75, msaa: 4, cube: 1024, tile: 256, tiles: 2.0, steps: 64, shadow: [4096, 1024], soft: true, aniso: 8, env: 256, duck: [60, 28], rip: 512, dof: 22 }
+    ][TIER];
+
+    if (params.has('msaa')) Q.msaa = parseInt(params.get('msaa')) || 0;
+
+    // the governor walks this ladder: resolution first, then cloud refresh rate and MSAA
+    const LADDER = [
+      { scale: 1.00, tiles: 1.00, msaa: Q.msaa },
+      { scale: 0.86, tiles: 0.75, msaa: Q.msaa },
+      { scale: 0.74, tiles: 0.50, msaa: Q.msaa },
+      { scale: 0.63, tiles: 0.50, msaa: Math.min(Q.msaa, 2) },
+      { scale: 0.54, tiles: 0.35, msaa: Math.min(Q.msaa, 2) },
+      { scale: 0.46, tiles: 0.25, msaa: 0 }
+    ];
+    const adaptive = !params.has('scale') && !CAPTURE;
+    let level = 0;
+    let renderScale = params.has('scale') ? THREE.MathUtils.clamp(parseFloat(params.get('scale')) || 1, 0.25, 1) : 1.0;
+    let msaa = Q.msaa;
+
+    const pixelRatio = () => Math.min(devicePixelRatio, Q.dpr, Math.sqrt(Q.budget / (innerWidth * innerHeight))) * renderScale;
     const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', preserveDrawingBuffer: CAPTURE });
     renderer.setPixelRatio(pixelRatio());
     renderer.setSize(innerWidth, innerHeight);
     renderer.toneMapping = params.get('tm') === 'agx' ? THREE.AgXToneMapping : THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = Q.soft ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
     renderer.shadowMap.autoUpdate = false;
     document.body.appendChild(renderer.domElement);
+    const gl = renderer.getContext();
+    const floatRT = renderer.extensions.has('EXT_color_buffer_float');
+    const maxAniso = Math.min(params.has('aniso') ? parseFloat(params.get('aniso')) : Q.aniso, renderer.capabilities.getMaxAnisotropy());
+
+    // a lost context on a struggling GPU comes back one tier lower (at most twice per tab)
+    renderer.domElement.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      try {
+        const n = +(sessionStorage.getItem('realReloads') || 0);
+        if (n >= 2) return;
+        sessionStorage.setItem('realReloads', String(n + 1));
+        sessionStorage.setItem('realTierCap', String(Math.max(0, TIER - 1)));
+      } catch (err) { return; }
+      setTimeout(() => location.reload(), 600);
+    });
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.5, 60000);
@@ -73,6 +124,11 @@
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
     controls.update();
+
+    const fsVS = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+    const fsQuad = new FullScreenQuad(null);
+    const blit = (mat, target) => { fsQuad.material = mat; renderer.setRenderTarget(target); fsQuad.render(renderer); };
+    const nextFrame = () => new Promise(r => requestAnimationFrame(r));
 
     // ------------------------------------------------------------------
     //  Physical atmosphere (shared constants between JS and GLSL)
@@ -211,91 +267,136 @@
     }
 
     // ------------------------------------------------------------------
+    //  Sky-view LUT: the atmosphere integral is smooth, so it is solved once
+    //  into a small (azimuth-from-sun, elevation) table a few times a second
+    //  and every consumer just looks it up. Clouds live in a separate cubemap
+    //  as (in-scattered light, transmittance), so the sky behind them is
+    //  always live even though the clouds themselves are time-sliced.
+    // ------------------------------------------------------------------
+    const LUT_W = 256, LUT_H = 128;
+    const lutRT = new THREE.WebGLRenderTarget(LUT_W, LUT_H, { type: THREE.HalfFloatType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    const lutMat = new THREE.ShaderMaterial({
+      uniforms: { uSunL: { value: new THREE.Vector2(1, 0) } },
+      vertexShader: fsVS,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        uniform vec2 uSunL;   // (cos, sin) of the sun elevation; the sun azimuth is +x in LUT space
+        ${ATMO_GLSL}
+        void main() {
+          vec2 uv = (gl_FragCoord.xy - 0.5) / vec2(${LUT_W - 1}.0, ${LUT_H - 1}.0);
+          float phi = uv.x * PI, el = uv.y * uv.y * 0.5 * PI;
+          vec3 rd = vec3(cos(el) * cos(phi), sin(el), cos(el) * sin(phi));
+          gl_FragColor = vec4(atmosphere(rd, vec3(uSunL.x, uSunL.y, 0.0)), 1.0);
+        }`
+    });
+    const SKYLUT_GLSL = /* glsl */`
+      uniform sampler2D tSkyLut;
+      uniform vec2 uSunAz;
+      vec3 skyLut(vec3 rd) {
+        float el = asin(clamp(rd.y, 0.0, 1.0));
+        float phi = acos(clamp(dot(rd.xz, uSunAz) / max(length(rd.xz), 1e-5), -1.0, 1.0));
+        vec2 uv = vec2(phi * 0.318309886, sqrt(el * 0.636619772));
+        return texture(tSkyLut, (uv * vec2(${LUT_W - 1}.0, ${LUT_H - 1}.0) + 0.5) / vec2(${LUT_W}.0, ${LUT_H}.0)).rgb;
+      }`;
+    // sky + clouds in one call. The cloud light is stored divided by a brightness key and
+    // multiplied back by the current one, so tiles rendered a second apart still match at dusk.
+    const SKY_GLSL = SKYLUT_GLSL + /* glsl */`
+      uniform samplerCube uSky;
+      uniform float uSkyKey;
+      vec4 skyAt(vec3 d) { vec4 c = texture(uSky, d); return vec4(skyLut(d) * c.a + c.rgb * uSkyKey, c.a); }`;
+    const skyU = { tSkyLut: { value: lutRT.texture }, uSunAz: { value: new THREE.Vector2(0, -1) }, uSky: { value: null }, uSkyKey: { value: 1 } };
+    function renderSkyLut() {
+      lutMat.uniforms.uSunL.value.set(Math.cos(SUN_ELEV), Math.sin(SUN_ELEV));
+      blit(lutMat, lutRT);
+    }
+
+    // ------------------------------------------------------------------
     //  3D cloud noise (tileable Perlin-Worley), baked on the GPU once
     // ------------------------------------------------------------------
     const NOISE_SIZE = 128;
     const noiseRT = new THREE.WebGL3DRenderTarget(NOISE_SIZE, NOISE_SIZE, NOISE_SIZE, { depthBuffer: false });
     Object.assign(noiseRT.texture, { wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, wrapR: THREE.RepeatWrapping, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, generateMipmaps: false });
-    {
-      const mat = new THREE.ShaderMaterial({
-        uniforms: { uZ: { value: 0 } },
-        vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
-        fragmentShader: /* glsl */`
-          varying vec2 vUv; uniform float uZ;
-          vec3 hash33(vec3 p) {
-            p = fract(p * vec3(0.1031, 0.1030, 0.0973));
-            p += dot(p, p.yxz + 33.33);
-            return fract((p.xxy + p.yxx) * p.zyx);
+    const noiseMat = new THREE.ShaderMaterial({
+      uniforms: { uZ: { value: 0 } },
+      vertexShader: fsVS,
+      fragmentShader: /* glsl */`
+        varying vec2 vUv; uniform float uZ;
+        vec3 hash33(vec3 p) {
+          p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+          p += dot(p, p.yxz + 33.33);
+          return fract((p.xxy + p.yxx) * p.zyx);
+        }
+        float gradNoise(vec3 x, float freq) {
+          vec3 p = floor(x), w = fract(x);
+          vec3 u = w * w * w * (w * (w * 6.0 - 15.0) + 10.0);
+          float r[8];
+          for (int i = 0; i < 8; i++) {
+            vec3 o = vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
+            vec3 g = normalize(hash33(mod(p + o, freq)) * 2.0 - 1.0);
+            r[i] = dot(g, w - o);
           }
-          float gradNoise(vec3 x, float freq) {
-            vec3 p = floor(x), w = fract(x);
-            vec3 u = w * w * w * (w * (w * 6.0 - 15.0) + 10.0);
-            float n = 0.0;
-            float r[8];
-            for (int i = 0; i < 8; i++) {
-              vec3 o = vec3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1));
-              vec3 g = normalize(hash33(mod(p + o, freq)) * 2.0 - 1.0);
-              r[i] = dot(g, w - o);
-            }
-            return mix(mix(mix(r[0], r[1], u.x), mix(r[2], r[3], u.x), u.y),
-                       mix(mix(r[4], r[5], u.x), mix(r[6], r[7], u.x), u.y), u.z);
+          return mix(mix(mix(r[0], r[1], u.x), mix(r[2], r[3], u.x), u.y),
+                     mix(mix(r[4], r[5], u.x), mix(r[6], r[7], u.x), u.y), u.z);
+        }
+        float worley(vec3 uv, float freq) {
+          vec3 id = floor(uv), p = fract(uv);
+          float md = 1e4;
+          for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) for (int z = -1; z <= 1; z++) {
+            vec3 o = vec3(x, y, z);
+            vec3 h = hash33(mod(id + o, vec3(freq))) + o;
+            vec3 d = p - h;
+            md = min(md, dot(d, d));
           }
-          float worley(vec3 uv, float freq) {
-            vec3 id = floor(uv), p = fract(uv);
-            float md = 1e4;
-            for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) for (int z = -1; z <= 1; z++) {
-              vec3 o = vec3(x, y, z);
-              vec3 h = hash33(mod(id + o, vec3(freq))) + o;
-              vec3 d = p - h;
-              md = min(md, dot(d, d));
-            }
-            return 1.0 - sqrt(md);
-          }
-          float perlinFbm(vec3 p, float freq, int oct) {
-            float G = exp2(-0.85), amp = 1.0, noise = 0.0;
-            for (int i = 0; i < oct; i++) { noise += amp * gradNoise(p * freq, freq); freq *= 2.0; amp *= G; }
-            return noise;
-          }
-          float worleyFbm(vec3 p, float freq) {
-            return worley(p * freq, freq) * 0.625 + worley(p * freq * 2.0, freq * 2.0) * 0.25 + worley(p * freq * 4.0, freq * 4.0) * 0.125;
-          }
-          float remap(float x, float a, float b, float c, float d) { return c + (x - a) / (b - a) * (d - c); }
-          void main() {
-            vec3 uvw = vec3(vUv, uZ);
-            float freq = 4.0;
-            float pfbm = mix(1.0, perlinFbm(uvw, 4.0, 7), 0.5);
-            pfbm = abs(pfbm * 2.0 - 1.0);
-            float g = worleyFbm(uvw, freq);
-            float b = worleyFbm(uvw, freq * 2.0);
-            float a = worleyFbm(uvw, freq * 4.0);
-            float r = clamp(remap(pfbm, 0.0, 1.0, g, 1.0), 0.0, 1.0);
-            gl_FragColor = vec4(r, g, b, a);
-          }`
-      });
-      const q = new FullScreenQuad(mat);
-      for (let z = 0; z < NOISE_SIZE; z++) {
-        mat.uniforms.uZ.value = (z + 0.5) / NOISE_SIZE;
+          return 1.0 - sqrt(md);
+        }
+        float perlinFbm(vec3 p, float freq, int oct) {
+          float G = exp2(-0.85), amp = 1.0, noise = 0.0;
+          for (int i = 0; i < oct; i++) { noise += amp * gradNoise(p * freq, freq); freq *= 2.0; amp *= G; }
+          return noise;
+        }
+        float remap(float x, float a, float b, float c, float d) { return c + (x - a) / (b - a) * (d - c); }
+        void main() {
+          vec3 uvw = vec3(vUv, uZ);
+          float pfbm = mix(1.0, perlinFbm(uvw, 4.0, 7), 0.5);
+          pfbm = abs(pfbm * 2.0 - 1.0);
+          // the three Worley fBms share octaves: five evaluations instead of nine
+          float w4 = worley(uvw * 4.0, 4.0), w8 = worley(uvw * 8.0, 8.0), w16 = worley(uvw * 16.0, 16.0);
+          float w32 = worley(uvw * 32.0, 32.0), w64 = worley(uvw * 64.0, 64.0);
+          float g = w4 * 0.625 + w8 * 0.25 + w16 * 0.125;
+          float b = w8 * 0.625 + w16 * 0.25 + w32 * 0.125;
+          float a = w16 * 0.625 + w32 * 0.25 + w64 * 0.125;
+          float r = clamp(remap(pfbm, 0.0, 1.0, g, 1.0), 0.0, 1.0);
+          gl_FragColor = vec4(r, g, b, a);
+        }`
+    });
+    function bakeNoise(z0, z1) {
+      fsQuad.material = noiseMat;
+      for (let z = z0; z < z1; z++) {
+        noiseMat.uniforms.uZ.value = (z + 0.5) / NOISE_SIZE;
         renderer.setRenderTarget(noiseRT, z);
-        q.render(renderer);
+        fsQuad.render(renderer);
       }
       renderer.setRenderTarget(null);
-      q.dispose(); mat.dispose();
     }
 
     // ------------------------------------------------------------------
-    //  Sky + volumetric clouds, rendered into an HDR cubemap
-    //  (one face per frame, so the expensive raymarch is amortised)
+    //  Volumetric clouds, raymarched into an HDR cubemap a few tiles per
+    //  frame. Tiles the camera (or its reflection) can see are refreshed
+    //  about three times as often as the rest; tiles below the horizon are
+    //  never touched.
     // ------------------------------------------------------------------
-    const cubeRT = new THREE.WebGLCubeRenderTarget(CUBE_SIZE, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+    const cubeRT = new THREE.WebGLCubeRenderTarget(Q.cube, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+    skyU.uSky.value = cubeRT.texture;
     const cubeCam = new THREE.CubeCamera(0.1, 10, cubeRT);
     cubeCam.coordinateSystem = renderer.coordinateSystem;
     cubeCam.updateCoordinateSystem();
     cubeCam.updateMatrixWorld(true);
     const cubeScene = new THREE.Scene();
 
-    const skyCubeMat = new THREE.ShaderMaterial({
+    const cloudMat = new THREE.ShaderMaterial({
       side: THREE.BackSide, depthWrite: false, depthTest: false,
       uniforms: {
+        tSkyLut: skyU.tSkyLut, uSunAz: skyU.uSunAz,
         uSun: { value: new THREE.Vector3() },
         uTime: { value: 0 },
         uNoise: { value: noiseRT.texture },
@@ -304,18 +405,19 @@
         uCoverage: { value: params.has('cov') ? parseFloat(params.get('cov')) : 0.2 },
         uSunHigh: { value: new THREE.Vector3() },
         uWind: { value: new THREE.Vector2(0.010, 0.004) },
-        uWaterTint: { value: new THREE.Vector3(0.002, 0.008, 0.008) }
+        uKey: { value: 1 }
       },
       vertexShader: `varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
       fragmentShader: /* glsl */`
         precision highp float;
         precision highp sampler3D;
         varying vec3 vDir;
-        uniform vec3 uSun, uSunCloud, uSunHigh, uAmb, uWaterTint;
-        uniform float uTime, uCoverage;
+        uniform vec3 uSun, uSunCloud, uSunHigh, uAmb;
+        uniform float uTime, uCoverage, uKey;
         uniform vec2 uWind;
         uniform sampler3D uNoise;
         ${ATMO_GLSL}
+        ${SKYLUT_GLSL}
 
         const float CB = 1.5;   // cloud base (km)
         const float CT = 4.2;   // cloud top (km) - tall, towering fair-weather cumulus
@@ -332,6 +434,7 @@
           float weather = texture(uNoise, vec3(q.xz * 0.011, 0.37)).r;
           float weather2 = texture(uNoise, vec3(q.xz * 0.004 + 0.3, 0.71)).g;
           float cov = clamp(uCoverage + (weather - 0.55) * 0.55 + (weather2 - 0.5) * 0.35, 0.0, 1.0);
+          if (cov < 0.004) return 0.0;
           vec4 n = texture(uNoise, q * vec3(0.052, 0.07, 0.052));
           float wf = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
           float base = remap(n.r, wf - 1.0, 1.0, 0.0, 1.0);
@@ -368,13 +471,12 @@
         // returns rgb = in-scattered light (premultiplied), a = transmittance, also outputs mean distance
         vec4 clouds(vec3 rd, out float dist) {
           dist = 0.0;
-          if (rd.y <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
           vec3 ro = vec3(0.0, PR + 0.01, 0.0);
           float t0 = raySphere(ro, rd, PR + CB).y;
           float t1 = raySphere(ro, rd, PR + CT).y;
           if (t0 > 160.0) return vec4(0.0, 0.0, 0.0, 1.0);
           t1 = min(t1, t0 + 26.0);
-          const int N = ${isMobile ? 36 : 56};
+          const int N = ${Q.steps};
           float dt = (t1 - t0) / float(N);
           float t = t0 + dt * hash12(gl_FragCoord.xy);
           float mu = dot(rd, uSun);
@@ -388,7 +490,7 @@
               float h = clamp((length(p) - PR - CB) / (CT - CB), 0.0, 1.0);
               float od = lightMarch(p);
               // multiple-scattering octaves (Hillaire 2016)
-              vec3 sun = vec3(0.0);
+              float sun = 0.0;
               float a = 1.0, b = 1.0, c = 1.0;
               for (int o = 0; o < 4; o++) {
                 sun += a * dualPhase(mu, c) * exp(-od * b);
@@ -414,17 +516,10 @@
 
         void main() {
           vec3 rd = normalize(vDir);
-          if (rd.y < 0.0) {
-            // below the horizon: reflective sea (used for image based lighting only)
-            vec3 rr = vec3(rd.x, -rd.y, rd.z);
-            float c = clamp(-rd.y, 0.0, 1.0);
-            float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
-            vec3 sky = atmosphere(rr, uSun);
-            gl_FragColor = vec4(sky * F + uWaterTint * uAmb * 3.0, 1.0);
-            return;
-          }
-          vec3 sky = atmosphere(rd, uSun);
+          if (rd.y < 0.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+          vec3 sky = skyLut(rd);
           // high cirrus / altocumulus veil (catches the last pink light)
+          float Tc = 1.0; vec3 Sc = vec3(0.0);
           {
             vec3 ro = vec3(0.0, PR + 0.01, 0.0);
             float tc = raySphere(ro, rd, PR + 7.5).y;
@@ -439,45 +534,155 @@
             den *= smoothstep(0.0, 0.04, rd.y) * smoothstep(420.0, 150.0, tc);
             float mu = dot(rd, uSun);
             vec3 lum = uSunHigh * (phaseHG(mu, 0.6) * 0.7 + 0.3 / (4.0 * PI)) * PI * 1.3 + uAmb * 1.2;
-            float a = 1.0 - exp(-den * 1.6);
-            float fog = 1.0 - exp(-tc / 90.0);
-            sky = mix(sky, mix(lum, sky, fog), a);
+            float a = (1.0 - exp(-den * 1.6)) * exp(-tc / 90.0);
+            Tc = 1.0 - a; Sc = lum * a;
           }
           float d;
           vec4 cl = clouds(rd, d);
-          // aerial perspective on cloud light
+          // aerial perspective on cloud light. Consumers add  skyLut * a  on top, so what is stored
+          // here is everything else: cloud light, cirrus, and the (small) sky terms they replace.
           float fog = 1.0 - exp(-d / 38.0);
-          vec3 col = sky * cl.a + mix(cl.rgb, sky * (1.0 - cl.a), fog);
-          gl_FragColor = vec4(col, cl.a);
+          float A = cl.a + (1.0 - cl.a) * fog;
+          vec3 col = sky * (Tc * A - cl.a) + Sc * A + cl.rgb * (1.0 - fog);
+          gl_FragColor = vec4(col / uKey, cl.a);
         }
       `
     });
-    cubeScene.add(new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48), skyCubeMat));
+    cubeScene.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), cloudMat));
 
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    let envRT = null;
-    let cubeFace = 0;
-    function renderCubeFace(i) {
-      renderer.setRenderTarget(cubeRT, i);
-      renderer.render(cubeScene, cubeCam.children[i]);
+    const TILES_PER = Q.cube / Q.tile;
+    const tiles = [];
+    {
+      const v = new THREE.Vector3();
+      for (let f = 0; f < 6; f++) for (let ty = 0; ty < TILES_PER; ty++) for (let tx = 0; tx < TILES_PER; tx++) {
+        const dirs = []; let maxY = -1;
+        for (let j = 0; j <= 2; j++) for (let i = 0; i <= 2; i++) {
+          v.set(((tx + i / 2) / TILES_PER) * 2 - 1, ((ty + j / 2) / TILES_PER) * 2 - 1, 0.5).unproject(cubeCam.children[f]).normalize();
+          dirs.push(v.clone()); maxY = Math.max(maxY, v.y);
+        }
+        if (maxY <= 0) continue;                       // entirely below the horizon
+        let cosR = 1; for (const d of dirs) cosR = Math.min(cosR, d.dot(dirs[4]));
+        tiles.push({ f, x: tx * Q.tile, y: ty * Q.tile, c: dirs[4], rad: Math.acos(cosR), last: -1e9, w: 1 });
+      }
     }
+    let frameNo = 0, tileBudget = 0;
+    function renderTile(tl) {
+      cubeRT.scissor.set(tl.x, tl.y, Q.tile, Q.tile);
+      cubeRT.scissorTest = true;
+      renderer.setRenderTarget(cubeRT, tl.f);
+      renderer.render(cubeScene, cubeCam.children[tl.f]);
+      tl.last = frameNo;
+    }
+    const _fw = new THREE.Vector3();
+    function weighTiles() {
+      camera.getWorldDirection(_fw);
+      const half = Math.atan(Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * Math.hypot(1, camera.aspect)) + 0.06;
+      for (const tl of tiles) {
+        const a = Math.acos(THREE.MathUtils.clamp(tl.c.x * _fw.x + tl.c.z * _fw.z + tl.c.y * _fw.y, -1, 1));
+        const b = Math.acos(THREE.MathUtils.clamp(tl.c.x * _fw.x + tl.c.z * _fw.z - tl.c.y * _fw.y, -1, 1));   // mirrored in the water
+        tl.w = Math.min(a, b) < half + tl.rad ? 1 : 0.3;
+      }
+    }
+    function pickTile() {
+      let best = tiles[0], bs = -1;
+      for (const tl of tiles) { const s = (frameNo - tl.last) * tl.w; if (s > bs) { bs = s; best = tl; } }
+      return best;
+    }
+    function clearCloudCube() {
+      cubeRT.scissorTest = false;
+      renderer.setClearColor(0x000000, 1);
+      for (let f = 0; f < 6; f++) { renderer.setRenderTarget(cubeRT, f); renderer.clear(true, false, false); }
+      renderer.setRenderTarget(null);
+    }
+
+    // ---- image-based lighting: a small box-filtered copy of the sky (plus a reflective sea below
+    //      the horizon) is what gets prefiltered, so the periodic PMREM rebuild stays cheap
+    const envSrcRT = new THREE.WebGLCubeRenderTarget(Q.env, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+    const envCam = new THREE.CubeCamera(0.1, 10, envSrcRT);
+    const envScene = new THREE.Scene();
+    const envMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false, depthTest: false,
+      uniforms: { ...skyU, uAmb: { value: new THREE.Vector3() }, uWaterTint: { value: new THREE.Vector3(0.002, 0.008, 0.008) } },
+      vertexShader: `varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        varying vec3 vDir;
+        uniform vec3 uAmb, uWaterTint;
+        ${SKY_GLSL}
+        void main() {
+          vec3 dx = dFdx(vDir), dy = dFdy(vDir);
+          vec3 acc = vec3(0.0);
+          for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) {
+            vec3 d = normalize(vDir + dx * ((float(i) + 0.5) * 0.25 - 0.5) + dy * ((float(j) + 0.5) * 0.25 - 0.5));
+            if (d.y < 0.0) {
+              float c = clamp(-d.y, 0.0, 1.0);
+              float F = 0.02 + 0.98 * pow(1.0 - c, 5.0);
+              acc += skyAt(normalize(vec3(d.x, max(-d.y, 0.003), d.z))).rgb * F + uWaterTint * uAmb * 3.0;
+            } else acc += skyAt(normalize(vec3(d.x, max(d.y, 0.003), d.z))).rgb;
+          }
+          gl_FragColor = vec4(acc / 16.0, 1.0);
+        }`
+    });
+    envScene.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), envMat));
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    let envRT = null, envKey = 1, envStage = 0;
+    function renderEnvCube() { envCam.update(renderer, envScene); envKey = skyU.uSkyKey.value; }
     function rebuildEnv() {
-      envRT = pmrem.fromCubemap(cubeRT.texture, envRT);
+      envRT = pmrem.fromCubemap(envSrcRT.texture, envRT);
       scene.environment = envRT.texture;
     }
 
+    // ---- how much of the solar disc the clouds let through, read back asynchronously
+    //      (drives the sun light, the glitter path and the lens flare)
+    const sunVisRT = new THREE.WebGLRenderTarget(1, 1, { depthBuffer: false });
+    const sunVisMat = new THREE.ShaderMaterial({
+      uniforms: { uSky: skyU.uSky, uSun: { value: new THREE.Vector3() } },
+      vertexShader: fsVS,
+      fragmentShader: /* glsl */`
+        uniform samplerCube uSky; uniform vec3 uSun;
+        void main() {
+          vec3 t = normalize(cross(uSun, vec3(0.0, 1.0, 0.0))), b = cross(t, uSun);
+          float a = 0.0;
+          for (int i = 0; i < 12; i++) {
+            float fi = float(i) + 0.5, r = sqrt(fi / 12.0) * 0.008, th = fi * 2.39996323;
+            vec3 d = normalize(uSun + (t * cos(th) + b * sin(th)) * r);
+            a += texture(uSky, vec3(d.x, max(d.y, 0.002), d.z)).a;
+          }
+          gl_FragColor = vec4(a / 12.0);
+        }`
+    });
+    let sunVis = 1, sunVisTarget = 1, sunVisPending = false;
+    const _sv = new Uint8Array(4);
+    function probeSunVis() {
+      if (sunVisPending) return;
+      sunVisMat.uniforms.uSun.value.copy(sunDir);
+      blit(sunVisMat, sunVisRT);
+      if (CAPTURE) { renderer.readRenderTargetPixels(sunVisRT, 0, 0, 1, 1, _sv); sunVisTarget = sunVis = _sv[0] / 255; return; }
+      sunVisPending = true;
+      renderer.readRenderTargetPixelsAsync(sunVisRT, 0, 0, 1, 1, _sv)
+        .then(() => { sunVisTarget = _sv[0] / 255; })
+        .catch(() => { sunVisTarget = 1; })
+        .finally(() => { sunVisPending = false; });
+    }
+
     // ------------------------------------------------------------------
-    //  Sky dome for the main view (samples the cubemap + analytic sun disk)
+    //  Sky dome for the main view: LUT sky + cloud cube + analytic sun disc
+    //  + a few stars and an evening star once the light goes
     // ------------------------------------------------------------------
     const SUN_ANG = THREE.MathUtils.degToRad(0.32);
     const skyDomeMat = new THREE.ShaderMaterial({
-      side: THREE.BackSide, depthWrite: false, depthTest: false,
+      side: THREE.BackSide, depthWrite: false, depthTest: true,
       uniforms: {
-        uSky: { value: cubeRT.texture },
+        ...skyU,
         uSun: { value: sunDir },
         uSunCos: { value: Math.cos(SUN_ANG) },
         uSunDisk: { value: new THREE.Vector3() },
-        uNoSun: { value: 0 }
+        uSquash: { value: 1 },
+        uNoSun: { value: 0 },
+        uStars: { value: 0 },
+        uVenus: { value: new THREE.Vector4(0, 1, 0, 0) },
+        uPix: { value: 0.001 },
+        uTime: { value: 0 }
       },
       vertexShader: /* glsl */`
         varying vec3 vDir;
@@ -488,17 +693,43 @@
           gl_Position = p;
         }`,
       fragmentShader: /* glsl */`
+        precision highp float;
         varying vec3 vDir;
-        uniform samplerCube uSky;
         uniform vec3 uSun, uSunDisk;
-        uniform float uSunCos, uNoSun;
+        uniform vec4 uVenus;
+        uniform float uSunCos, uNoSun, uSquash, uStars, uPix, uTime;
+        ${SKY_GLSL}
+        vec3 hash32(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+          p3 += dot(p3, p3.yxz + 33.33);
+          return fract((p3.xxy + p3.yzz) * p3.zyx);
+        }
+        // sparse point stars on a cube-face lattice; every star is a ~1.5px soft dot that twinkles
+        float stars(vec3 d) {
+          vec3 a = abs(d); vec2 uv; float face;
+          if (a.y >= a.x && a.y >= a.z) { uv = d.xz / a.y; face = 0.0; }
+          else if (a.x >= a.z) { uv = d.zy / a.x; face = d.x > 0.0 ? 1.0 : 2.0; }
+          else { uv = d.xy / a.z; face = d.z > 0.0 ? 3.0 : 4.0; }
+          const float n = 46.0;
+          vec2 g = uv * n, id = floor(g);
+          vec3 h = hash32(id + face * 71.0);
+          vec3 h2 = hash32(id.yx + face * 13.0 + 5.0);
+          if (h2.x > 0.16) return 0.0;
+          float px = uPix * n * (1.0 + dot(uv, uv)) * 0.8;
+          float dd = length(g - id - 0.2 - 0.6 * h.xy) / px;
+          float mag = 0.25 + 3.0 * pow(h2.y, 5.0);
+          float tw = 0.72 + 0.28 * sin(uTime * (1.6 + 3.0 * h.z) + h.z * 50.0);
+          return smoothstep(1.7, 0.5, dd) * mag * tw;
+        }
         void main() {
           vec3 d = normalize(vDir);
           vec3 dd = normalize(vec3(d.x, max(d.y, 0.0008), d.z));
-          vec4 s = texture(uSky, dd);
+          vec4 s = skyAt(dd);
           vec3 col = s.rgb;
           if (uNoSun < 0.5) {
-            float c = dot(d, uSun);
+            // atmospheric refraction flattens the low sun a little
+            vec3 o = d - uSun;
+            float c = dot(normalize(uSun + vec3(o.x, o.y / uSquash, o.z)), uSun);
             float w = fwidth(c) * 1.5;
             float disk = smoothstep(uSunCos - w, uSunCos + w, c);
             if (disk > 0.0) {
@@ -507,26 +738,37 @@
               vec3 limb = vec3(1.0) - vec3(0.397, 0.503, 0.652) * (1.0 - pow(vec3(mu), vec3(0.6)));
               col += uSunDisk * limb * disk * s.a;
             }
+            if (uStars > 0.0) {
+              float ext = s.a * smoothstep(0.02, 0.3, d.y);
+              col += vec3(0.82, 0.9, 1.0) * (stars(d) * uStars * ext);
+              float vd = acos(clamp(dot(d, uVenus.xyz), -1.0, 1.0)) / uPix;
+              col += vec3(1.0, 0.96, 0.88) * (smoothstep(2.4, 0.8, vd) * uVenus.w * s.a);
+            }
           }
           gl_FragColor = vec4(col, 1.0);
         }`
     });
-    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 32), skyDomeMat);
+    const skyDome = new THREE.Mesh(new THREE.SphereGeometry(1, 48, 24), skyDomeMat);
     skyDome.frustumCulled = false;
-    skyDome.renderOrder = -1000;
+    skyDome.renderOrder = 1000;   // drawn last: depth-tested against water and ducks, so hidden sky is never shaded
     scene.add(skyDome);
 
     // ------------------------------------------------------------------
-    //  Waves: shared between the GPU water and CPU duck buoyancy
+    //  Waves: shared between the GPU water and CPU duck buoyancy.
+    //  Every angular frequency is snapped to a multiple of 2*pi/LOOP so the
+    //  whole sea repeats exactly every LOOP seconds: the shaders only ever
+    //  see a small, wrapped time and stay precise however long the page runs.
     // ------------------------------------------------------------------
     const GRAV = 40.0; // effective gravity in scene units (ducks read as ~1.5m giants on a slow swell)
+    const LOOP = 600, W0 = 2 * Math.PI / LOOP;
+    const loopW = (w) => Math.max(1, Math.round(w / W0)) * W0;
     let seed = 7;
     const rand = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
     const windAng = Math.atan2(0.6, 0.8);
     const swell = [];
     [[260, 0.30, 0.0], [175, 0.20, 0.45], [118, 0.13, -0.5], [74, 0.07, 0.9]].forEach(([wl, amp, da]) => {
       const k = 2 * Math.PI / wl, a = windAng + da;
-      swell.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp, w: Math.sqrt(GRAV * k), ph: rand() * 6.283, q: 0.35 });
+      swell.push({ dx: Math.cos(a), dz: Math.sin(a), k, amp, w: loopW(Math.sqrt(GRAV * k)), ph: rand() * 6.283, q: 0.35 });
     });
     // ------------------------------------------------------------------
     //  Wind waves: GPU FFT ocean (Tessendorf). A directional wind spectrum is
@@ -535,9 +777,9 @@
     //  wavelengths from ~60 units down to ~0.3 without visible tiling. The maps
     //  store (sx, sz, sx^2, sz^2) and are mipmapped, so distant water averages
     //  slopes and keeps their variance as roughness (correct sun glitter).
+    //  All three cascades share one atlas, so the whole transform is 16 passes.
     // ------------------------------------------------------------------
     const FFT_N = 128, FFT_LOG = 7;
-    const floatRT = renderer.extensions.has('EXT_color_buffer_float');
     const CASCADES = [
       { L: 377, band: [12.0, 60.0], rot: 0.0 },
       { L: 61.3, band: [1.9, 12.0], rot: 0.71 },
@@ -545,6 +787,7 @@
     ];
     const WIND_SPEED = 9.0;
     const gauss = () => { const u = Math.max(rand(), 1e-9), v = rand(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    let h0Tex;
     {
       const Lw = WIND_SPEED * WIND_SPEED / GRAV;
       const wx = Math.cos(windAng), wz = Math.sin(windAng);
@@ -570,97 +813,98 @@
         }
         c.h0data = data;
       }
-      // normalise to a calm-sea rms slope
+      // normalise to a calm-sea rms slope, and pack the three spectra side by side
       const TARGET_RMS = 0.075;
       const sc = TARGET_RMS / Math.sqrt(slopeVar);
-      for (const c of CASCADES) {
-        for (let i = 0; i < c.h0data.length; i++) c.h0data[i] *= sc;
-        c.h0 = new THREE.DataTexture(c.h0data, FFT_N, FFT_N, THREE.RGBAFormat, THREE.FloatType);
-        c.h0.minFilter = c.h0.magFilter = THREE.NearestFilter;
-        c.h0.needsUpdate = true;
-      }
+      const atlas = new Float32Array(3 * FFT_N * FFT_N * 4);
+      CASCADES.forEach((c, ci) => {
+        for (let m = 0; m < FFT_N; m++) for (let n = 0; n < FFT_N; n++) {
+          const s = (m * FFT_N + n) * 4, d = (m * 3 * FFT_N + ci * FFT_N + n) * 4;
+          atlas[d] = c.h0data[s] * sc; atlas[d + 1] = c.h0data[s + 1] * sc;
+        }
+        delete c.h0data;
+      });
+      h0Tex = new THREE.DataTexture(atlas, 3 * FFT_N, FFT_N, THREE.RGBAFormat, THREE.FloatType);
+      h0Tex.minFilter = h0Tex.magFilter = THREE.NearestFilter;
+      h0Tex.needsUpdate = true;
     }
-    const fftRT = () => new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false, generateMipmaps: false });
+    const fftRT = () => new THREE.WebGLRenderTarget(3 * FFT_N, FFT_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false, generateMipmaps: false });
+    let fftPing = fftRT(), fftPong = fftRT();
     for (const c of CASCADES) {
-      c.ping = fftRT(); c.pong = fftRT();
-      c.out = new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, anisotropy: renderer.capabilities.getMaxAnisotropy() });
+      c.out = new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, anisotropy: maxAniso });
     }
     const fftVS = `void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+    // spectrum at time t, fused with the first (twiddle-free) butterfly stage
     const specMat = new THREE.ShaderMaterial({
-      uniforms: { tH0: { value: null }, uL: { value: 1 }, uTime: { value: 0 } },
+      uniforms: { tH0: { value: h0Tex }, uL: { value: new THREE.Vector3(...CASCADES.map(c => c.L)) }, uTime: { value: 0 } },
       vertexShader: fftVS,
       fragmentShader: /* glsl */`
         precision highp float;
-        uniform sampler2D tH0; uniform float uL, uTime;
+        uniform sampler2D tH0; uniform vec3 uL; uniform float uTime;
+        const int N = ${FFT_N};
         int bitrev(int v) { int r = 0; for (int i = 0; i < ${FFT_LOG}; i++) { r = (r << 1) | (v & 1); v >>= 1; } return r; }
         vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
-        void main() {
-          ivec2 p = ivec2(gl_FragCoord.xy);
-          int n = bitrev(p.x), m = bitrev(p.y);   // write in bit-reversed order for the DIT passes
-          const int N = ${FFT_N};
-          vec2 h0 = texelFetch(tH0, ivec2(n, m), 0).xy;
-          vec2 h0m = texelFetch(tH0, ivec2((N - n) % N, (N - m) % N), 0).xy;
-          float kx = 6.2831853 * float(n < N / 2 ? n : n - N) / uL;
-          float kz = 6.2831853 * float(m < N / 2 ? m : m - N) / uL;
+        vec2 spec(int x, int y, int ci) {
+          int n = bitrev(x), m = bitrev(y);   // bit-reversed order for the DIT passes
+          float L = ci == 0 ? uL.x : (ci == 1 ? uL.y : uL.z);
+          vec2 h0 = texelFetch(tH0, ivec2(ci * N + n, m), 0).xy;
+          vec2 h0m = texelFetch(tH0, ivec2(ci * N + (N - n) % N, (N - m) % N), 0).xy;
+          float kx = 6.2831853 * float(n < N / 2 ? n : n - N) / L;
+          float kz = 6.2831853 * float(m < N / 2 ? m : m - N) / L;
           float k = length(vec2(kx, kz));
-          float w = sqrt(${GRAV.toFixed(1)} * k);
+          float w = max(1.0, floor(sqrt(${GRAV.toFixed(1)} * k) / ${W0.toFixed(9)} + 0.5)) * ${W0.toFixed(9)};
           vec2 e = vec2(cos(w * uTime), sin(w * uTime));
           vec2 hk = cmul(h0, e) + cmul(vec2(h0m.x, -h0m.y), vec2(e.x, -e.y));
           // pack both slope spectra into one complex field: F = i kx h + i (i kz h)
-          vec2 F = cmul(hk, vec2(-kz, kx));
-          gl_FragColor = vec4(F, 0.0, 1.0);
+          return cmul(hk, vec2(-kz, kx));
+        }
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          int ci = p.x / N, i = p.x - ci * N, ia = i - (i & 1);
+          vec2 a = spec(ia, p.y, ci), b = spec(ia + 1, p.y, ci);
+          gl_FragColor = vec4((i & 1) == 0 ? a + b : a - b, 0.0, 1.0);
         }`
     });
     const bflyMat = new THREE.ShaderMaterial({
-      uniforms: { tIn: { value: null }, uSize: { value: 2 }, uHoriz: { value: 1 } },
+      uniforms: { tIn: { value: null }, uSize: { value: 2 }, uHoriz: { value: 1 }, uCi: { value: -1 } },
       vertexShader: fftVS,
       fragmentShader: /* glsl */`
         precision highp float;
-        uniform sampler2D tIn; uniform int uSize, uHoriz;
+        uniform sampler2D tIn; uniform int uSize, uHoriz, uCi;
+        const int N = ${FFT_N};
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy);
-          int i = uHoriz == 1 ? p.x : p.y;
+          // uCi >= 0: last stage, written straight into that cascade's mipmapped slope map
+          int ci = uCi >= 0 ? uCi : p.x / N;
+          int lx = uCi >= 0 ? p.x : p.x - ci * N;
+          int ox = ci * N;
+          int i = uHoriz == 1 ? lx : p.y;
           int half_ = uSize / 2;
           int pos = i % uSize;
           int j = pos % half_;
           int ia = i - pos + j, ib = ia + half_;
-          vec2 a = texelFetch(tIn, uHoriz == 1 ? ivec2(ia, p.y) : ivec2(p.x, ia), 0).xy;
-          vec2 b = texelFetch(tIn, uHoriz == 1 ? ivec2(ib, p.y) : ivec2(p.x, ib), 0).xy;
+          vec2 a = texelFetch(tIn, uHoriz == 1 ? ivec2(ox + ia, p.y) : ivec2(ox + lx, ia), 0).xy;
+          vec2 b = texelFetch(tIn, uHoriz == 1 ? ivec2(ox + ib, p.y) : ivec2(ox + lx, ib), 0).xy;
           float ang = 6.2831853 * float(j) / float(uSize);
           vec2 tw = vec2(cos(ang), sin(ang));
           vec2 bt = vec2(b.x * tw.x - b.y * tw.y, b.x * tw.y + b.y * tw.x);
-          gl_FragColor = vec4(pos < half_ ? a + bt : a - bt, 0.0, 1.0);
+          vec2 s = pos < half_ ? a + bt : a - bt;
+          gl_FragColor = uCi >= 0 ? vec4(s, s * s) : vec4(s, 0.0, 1.0);
         }`
     });
-    const assembleMat = new THREE.ShaderMaterial({
-      uniforms: { tIn: { value: null } },
-      vertexShader: fftVS,
-      fragmentShader: /* glsl */`
-        precision highp float;
-        uniform sampler2D tIn;
-        void main() {
-          vec2 s = texelFetch(tIn, ivec2(gl_FragCoord.xy), 0).xy;
-          gl_FragColor = vec4(s, s * s);
-        }`
-    });
-    const fftQuad = new FullScreenQuad(null);
     function updateOcean(t) {
-      for (const c of CASCADES) {
-        specMat.uniforms.tH0.value = c.h0; specMat.uniforms.uL.value = c.L; specMat.uniforms.uTime.value = t;
-        fftQuad.material = specMat;
-        renderer.setRenderTarget(c.ping); fftQuad.render(renderer);
-        let src = c.ping, dst = c.pong;
-        fftQuad.material = bflyMat;
-        for (const horiz of [1, 0]) for (let s = 1; s <= FFT_LOG; s++) {
-          bflyMat.uniforms.tIn.value = src.texture; bflyMat.uniforms.uSize.value = 1 << s; bflyMat.uniforms.uHoriz.value = horiz;
-          renderer.setRenderTarget(dst); fftQuad.render(renderer);
-          [src, dst] = [dst, src];
-        }
-        assembleMat.uniforms.tIn.value = src.texture;
-        fftQuad.material = assembleMat;
-        renderer.setRenderTarget(c.out); fftQuad.render(renderer);
+      specMat.uniforms.uTime.value = t;
+      blit(specMat, fftPing);
+      let src = fftPing, dst = fftPong;
+      const u = bflyMat.uniforms;
+      u.uCi.value = -1;
+      for (const horiz of [1, 0]) for (let s = horiz ? 2 : 1; s <= (horiz ? FFT_LOG : FFT_LOG - 1); s++) {
+        u.tIn.value = src.texture; u.uSize.value = 1 << s; u.uHoriz.value = horiz;
+        blit(bflyMat, dst);
+        [src, dst] = [dst, src];
       }
-      renderer.setRenderTarget(null);
+      u.tIn.value = src.texture; u.uSize.value = 1 << FFT_LOG; u.uHoriz.value = 0;
+      CASCADES.forEach((c, ci) => { u.uCi.value = ci; blit(bflyMat, c.out); });
     }
 
     function waveHeight(x, z, t) {
@@ -731,8 +975,7 @@
       return smin(body, beak, 0.2);
     }
 
-    function buildDuckGeometry() {
-      const N = isMobile ? 64 : 84;
+    function buildDuckGeometry(N) {
       const lo = [-3.4, -1.9, -4.3], hi = [3.4, 5.2, 5.1];
       const step = [(hi[0] - lo[0]) / (N - 1), (hi[1] - lo[1]) / (N - 1), (hi[2] - lo[2]) / (N - 1)];
       const field = new Float32Array(N * N * N);
@@ -811,7 +1054,7 @@
     function buildEyeGeometry() {
       // painted eyes: white oval, black pupil, white glint — each a thin shell following the head
       const pos = [], nor = [], col = [], ind = [];
-      const sph = new THREE.SphereGeometry(1, 24, 16);
+      const sph = new THREE.SphereGeometry(1, 14, 8);
       const sp = sph.attributes.position, sn = sph.attributes.normal, si = sph.index.array;
       const white = new THREE.Color(0xf6f4ee), black = new THREE.Color(0x030303);
       const add = (m, c) => {
@@ -850,7 +1093,10 @@
       return geo;
     }
 
-    const duckGeo = buildDuckGeometry();
+    // full-detail hull for the main view, a much lighter one for the shadow map, the
+    // planar reflection and the refraction pass (which are small, blurred or both)
+    const duckGeo = buildDuckGeometry(Q.duck[0]);
+    const duckGeoLo = buildDuckGeometry(Q.duck[1]);
     const eyeGeo = buildEyeGeometry();
 
     const vinyl = new THREE.MeshPhysicalMaterial({
@@ -859,13 +1105,18 @@
       sheen: 0.25, sheenRoughness: 0.6, sheenColor: new THREE.Color(0xffe9a0),
       envMapIntensity: 1.0
     });
-    // subtle translucency: thin vinyl glows when back-lit by the low sun
+    // subtle translucency: thin vinyl glows when back-lit by the low sun.
+    // Just above the waterline the hull is wet: a touch darker and much glossier.
     vinyl.onBeforeCompile = (sh) => {
       sh.uniforms.uSunDirV = { value: sunDir };
       sh.uniforms.uSunColV = { value: new THREE.Vector3() };
       vinyl.userData.shader = sh;
       sh.fragmentShader = sh.fragmentShader
         .replace('#include <common>', '#include <common>\nuniform vec3 uSunDirV; uniform vec3 uSunColV;')
+        .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+          float wetV = 1.0 - smoothstep(0.15, 1.5, vWorldPosV.y);
+          roughnessFactor *= 1.0 - 0.6 * wetV;
+          diffuseColor.rgb *= 1.0 - 0.14 * wetV;`)
         .replace('#include <opaque_fragment>', `
           {
             vec3 Vw = normalize(cameraPosition - vWorldPosV);
@@ -888,16 +1139,21 @@
           }`);
     };
     const paint = new THREE.MeshPhysicalMaterial({ vertexColors: true, roughness: 0.18, clearcoat: 1.0, clearcoatRoughness: 0.06 });
+    const vinylLo = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.34, metalness: 0.0 });
+    const paintLo = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.15, metalness: 0.0 });
 
     const DUCKS = 30;
     const duckMesh = new THREE.InstancedMesh(duckGeo, vinyl, DUCKS);
     const eyeMesh = new THREE.InstancedMesh(eyeGeo, paint, DUCKS);
-    for (const m of [duckMesh, eyeMesh]) {
-      m.castShadow = true; m.receiveShadow = true; m.frustumCulled = false;
-      m.layers.enable(1);
-      m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-      scene.add(m);
-    }
+    const duckLo = new THREE.InstancedMesh(duckGeoLo, vinylLo, DUCKS);
+    const eyeLo = new THREE.InstancedMesh(eyeGeo, paintLo, DUCKS);
+    duckMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    for (const m of [eyeMesh, duckLo, eyeLo]) m.instanceMatrix = duckMesh.instanceMatrix;   // one buffer, uploaded once per frame
+    for (const m of [duckMesh, eyeMesh, duckLo, eyeLo]) { m.receiveShadow = true; m.frustumCulled = false; scene.add(m); }
+    duckLo.castShadow = true;
+    duckLo.layers.enable(1); eyeLo.layers.enable(1);   // layer 1 = the refraction pass
+    duckLo.visible = eyeLo.visible = false;
+    const showLod = (lo) => { duckLo.visible = eyeLo.visible = lo; duckMesh.visible = eyeMesh.visible = !lo; };
 
     const ducks = [];
     for (let i = 0; i < DUCKS; i++) {
@@ -908,7 +1164,8 @@
         yaw: Math.random() * Math.PI * 2,
         driftX: (Math.random() - 0.5) * 0.05, driftZ: (Math.random() - 0.5) * 0.05,
         rotateSpeed: (Math.random() - 0.5) * 0.005,
-        tx: 0, tz: 0, wob: Math.random() * 10
+        tx: 0, tz: 0, wob: Math.random() * 10,
+        rw: 3.1 + Math.random() * 1.1, rp: Math.random() * 6.283   // ripple carrier: frequency, phase
       });
     }
 
@@ -917,7 +1174,7 @@
     // ------------------------------------------------------------------
     const sunLight = new THREE.DirectionalLight(0xffffff, 1);
     sunLight.castShadow = true;
-    sunLight.shadow.mapSize.set(isMobile ? 2048 : 4096, isMobile ? 512 : 1024);
+    sunLight.shadow.mapSize.set(Q.shadow[0], Q.shadow[1]);
     Object.assign(sunLight.shadow.camera, { left: -135, right: 135, top: 14, bottom: -8, near: 1, far: 700 });
     sunLight.shadow.bias = -0.0004;
     sunLight.shadow.normalBias = 0.06;
@@ -927,22 +1184,22 @@
 
     // ------------------------------------------------------------------
     //  Round, energy-conserving bloom: 13-tap downsample + tent upsample
-    //  mip chain (no separable kernels, so bright suns stay circular)
+    //  mip chain (no separable kernels, so bright suns stay circular).
+    //  It starts from the half-resolution depth-of-field buffer.
     // ------------------------------------------------------------------
     class Bloom {
       constructor() {
         this.mips = [];
-        const vs = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
         this.down = new THREE.ShaderMaterial({
           uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uFirst: { value: 0 } },
-          vertexShader: vs,
+          vertexShader: fsVS,
           fragmentShader: /* glsl */`
             varying vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uFirst;
             vec3 tap(vec2 o) {
               vec3 c = texture(tSrc, vUv + o * uTexel).rgb;
               // soft-limit extreme HDR spikes (the sun) so the glow stays smooth and round
               float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-              return uFirst > 0.5 ? c * (1.0 / (1.0 + l / 400.0)) : c;
+              return c * (1.0 / (1.0 + l * uFirst));
             }
             void main() {
               vec3 a = tap(vec2(-2, 2)), b = tap(vec2(0, 2)), c = tap(vec2(2, 2));
@@ -954,13 +1211,13 @@
             }`
         });
         this.up = new THREE.ShaderMaterial({
-          uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() }, uRadius: { value: 1.0 } },
-          vertexShader: vs,
+          uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } },
+          vertexShader: fsVS,
           blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, transparent: true,
           fragmentShader: /* glsl */`
-            varying vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel; uniform float uRadius;
+            varying vec2 vUv; uniform sampler2D tSrc; uniform vec2 uTexel;
             void main() {
-              vec2 t = uTexel * uRadius;
+              vec2 t = uTexel;
               vec3 s = texture(tSrc, vUv).rgb * 4.0;
               s += (texture(tSrc, vUv + vec2(-t.x, 0.0)).rgb + texture(tSrc, vUv + vec2(t.x, 0.0)).rgb +
                     texture(tSrc, vUv + vec2(0.0, -t.y)).rgb + texture(tSrc, vUv + vec2(0.0, t.y)).rgb) * 2.0;
@@ -969,7 +1226,6 @@
               gl_FragColor = vec4(s / 16.0, 1.0);
             }`
         });
-        this.quad = new FullScreenQuad(null);
       }
       setSize(w, h) {
         this.mips.forEach(m => m.dispose());
@@ -980,24 +1236,23 @@
           cw = Math.max(1, cw >> 1); ch = Math.max(1, ch >> 1);
         }
       }
-      render(renderer, src, srcW, srcH) {
+      // src is the half-res DOF buffer; fullW/fullH are the scene size it was reduced from
+      render(src, fullW, fullH, exposure) {
         const ac = renderer.autoClear;
-        let input = src, iw = srcW, ih = srcH;
-        this.quad.material = this.down;
+        let input = src, iw = fullW, ih = fullH;
         this.mips.forEach((m, i) => {
           this.down.uniforms.tSrc.value = input;
           this.down.uniforms.uTexel.value.set(1 / iw, 1 / ih);
-          this.down.uniforms.uFirst.value = i === 0 ? 1 : 0;
-          renderer.setRenderTarget(m); this.quad.render(renderer);
+          this.down.uniforms.uFirst.value = i === 0 ? exposure / 400 : 0;
+          blit(this.down, m);
           input = m.texture; iw = m.width; ih = m.height;
         });
         renderer.autoClear = false;
-        this.quad.material = this.up;
         for (let i = this.mips.length - 1; i > 0; i--) {
           const s = this.mips[i];
           this.up.uniforms.tSrc.value = s.texture;
           this.up.uniforms.uTexel.value.set(1 / s.width, 1 / s.height);
-          renderer.setRenderTarget(this.mips[i - 1]); this.quad.render(renderer);
+          blit(this.up, this.mips[i - 1]);
         }
         renderer.autoClear = ac;
         return this.mips[0].texture;
@@ -1008,30 +1263,121 @@
     //  Render targets
     // ------------------------------------------------------------------
     const size = new THREE.Vector2();
-    const mkRT = (w, h, o = {}) => new THREE.WebGLRenderTarget(w, h, Object.assign({ type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter }, o));
-    let sceneRT, reflRT, refrRT, dofRT, bloom;
+    const mkRT = (w, h, o = {}) => new THREE.WebGLRenderTarget(w, h, Object.assign({ type: THREE.HalfFloatType, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false }, o));
+    let sceneRT, reflRT, refrRT, dofA, dofB, bloom;
 
     function allocTargets() {
       renderer.getDrawingBufferSize(size);
-      const w = size.x, h = size.y;
-      [sceneRT, reflRT, refrRT, dofRT].forEach(r => r && r.dispose());
-      sceneRT = mkRT(w, h, { samples: 4, depthTexture: new THREE.DepthTexture(w, h, THREE.FloatType) });
-      reflRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
-      refrRT = mkRT(Math.ceil(w / 2), Math.ceil(h / 2), { depthTexture: new THREE.DepthTexture(Math.ceil(w / 2), Math.ceil(h / 2), THREE.FloatType) });
-      dofRT = mkRT(w, h);
+      const w = size.x, h = size.y, hw = Math.ceil(w / 2), hh = Math.ceil(h / 2);
+      [sceneRT, reflRT, refrRT, dofA, dofB].forEach(r => r && r.dispose());
+      sceneRT = mkRT(w, h, { samples: msaa, depthBuffer: true, depthTexture: new THREE.DepthTexture(w, h, THREE.FloatType) });
+      reflRT = mkRT(hw, hh, { depthBuffer: true, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter });
+      refrRT = mkRT(hw, hh, { depthBuffer: true, depthTexture: new THREE.DepthTexture(hw, hh, THREE.FloatType) });
+      dofA = mkRT(hw, hh); dofB = mkRT(hw, hh);
       if (!bloom) bloom = new Bloom();
       bloom.setSize(w, h);
     }
     allocTargets();
 
     // ------------------------------------------------------------------
+    //  Duck ripples: a small wave-equation simulation on a height field
+    //  covering the pond. Each duck drives the water along its waterline as
+    //  it bobs, so rings genuinely leave the hull, spread, interfere with the
+    //  neighbours' rings, bend around other ducks and fade out.
+    // ------------------------------------------------------------------
+    const RIP_N = Q.rip, RIP_L = 236;
+    const RIP_GAIN = params.has('rings') ? parseFloat(params.get('rings')) : 1.0;
+    const mkRip = () => new THREE.WebGLRenderTarget(RIP_N, RIP_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
+    let ripA = mkRip(), ripB = mkRip();
+    const ripOut = new THREE.WebGLRenderTarget(RIP_N, RIP_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, anisotropy: maxAniso });
+    const duckA = Array.from({ length: DUCKS }, () => new THREE.Vector4());   // x, z, yaw, scale
+    const duckB = Array.from({ length: DUCKS }, () => new THREE.Vector4());   // ring drive, -, vx, vz
+    const RIP_COMMON = /* glsl */`
+      precision highp float;
+      #define DUCKS ${DUCKS}
+      uniform sampler2D tPrev;
+      uniform vec4 uDuckA[DUCKS];
+      uniform vec4 uDuckB[DUCKS];
+      const float RN = ${RIP_N}.0, RL = ${RIP_L}.0, DX = RL / RN;
+      float H(ivec2 p) { return texelFetch(tPrev, clamp(p, ivec2(0), ivec2(${RIP_N - 1})), 0).x; }
+      // signed distance (roughly, in world units) from a duck's waterline
+      float hullEdge(vec2 rel, vec4 d) {
+        float c = cos(d.z), s = sin(d.z);
+        vec2 loc = vec2(rel.x * c - rel.y * s, rel.x * s + rel.y * c) / d.w;
+        return (length(loc / vec2(2.55, 3.25)) - 1.0) * 2.9 * d.w;
+      }`;
+    const ripSimMat = new THREE.ShaderMaterial({
+      uniforms: { tPrev: { value: null }, uDuckA: { value: duckA }, uDuckB: { value: duckB }, uDt: { value: 1 / 60 } },
+      vertexShader: fftVS,
+      fragmentShader: RIP_COMMON + /* glsl */`
+        uniform float uDt;
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          vec2 s = texelFetch(tPrev, p, 0).xy;                    // height, vertical velocity
+          float lap = (H(p + ivec2(1, 0)) + H(p - ivec2(1, 0)) + H(p + ivec2(0, 1)) + H(p - ivec2(0, 1)) - 4.0 * s.x) / (DX * DX);
+          vec2 xz = (gl_FragCoord.xy / RN - 0.5) * RL;
+          float force = 0.0, hull = 0.0;
+          for (int j = 0; j < DUCKS; j++) {
+            vec4 d = uDuckA[j];
+            vec2 rel = xz - d.xy;
+            float r2 = dot(rel, rel), R = 3.4 * d.w + 2.6;
+            if (r2 > R * R) continue;
+            float edge = hullEdge(rel, d);
+            vec4 db = uDuckB[j];
+            float ring = exp(-edge * edge * 2.2);                 // a band ~1 unit wide hugging the hull
+            force += ring * (db.x + 0.15 * dot(rel / max(sqrt(r2), 1e-3), db.zw));   // bobbing + a little bow wave
+            hull = max(hull, smoothstep(-0.35, -1.3, edge));
+          }
+          const float C2 = 2.6 * 2.6;                              // ring speed^2
+          float v = s.y + (C2 * lap - 0.6 * s.y + force) * uDt;
+          float h = s.x + v * uDt;
+          // the surface is pinned under the hulls; a sponge at the border swallows what reaches it
+          float border = (0.5 - max(abs(xz.x), abs(xz.y)) / RL) * RL;
+          float kill = max(hull, smoothstep(14.0, 0.0, border));
+          float keep = exp(-kill * 14.0 * uDt);
+          gl_FragColor = vec4(h * keep, v * keep, 0.0, 1.0);
+        }`
+    });
+    // slopes (bilinear + mip filtered for the water shader), contact shading, height
+    const ripOutMat = new THREE.ShaderMaterial({
+      uniforms: { tPrev: { value: null }, uDuckA: { value: duckA }, uDuckB: { value: duckB } },
+      vertexShader: fftVS,
+      fragmentShader: RIP_COMMON + /* glsl */`
+        void main() {
+          ivec2 p = ivec2(gl_FragCoord.xy);
+          vec2 slope = vec2(H(p + ivec2(1, 0)) - H(p - ivec2(1, 0)), H(p + ivec2(0, 1)) - H(p - ivec2(0, 1))) / (2.0 * DX);
+          vec2 xz = (gl_FragCoord.xy / RN - 0.5) * RL;
+          float contact = 0.0;
+          for (int j = 0; j < DUCKS; j++) {
+            vec4 d = uDuckA[j];
+            vec2 rel = xz - d.xy;
+            float r2 = dot(rel, rel), R = 3.4 * d.w + 6.0;
+            if (r2 > R * R) continue;
+            float edge = hullEdge(rel, d);
+            if (edge < -0.5) continue;
+            contact += exp(-max(edge, 0.0) / 1.1);
+          }
+          gl_FragColor = vec4(slope, contact, H(p));
+        }`
+    });
+    function stepRipples(dt) {
+      ripSimMat.uniforms.uDt.value = Math.min(dt, 1 / 30);
+      ripSimMat.uniforms.tPrev.value = ripA.texture;
+      blit(ripSimMat, ripB);
+      [ripA, ripB] = [ripB, ripA];
+      ripOutMat.uniforms.tPrev.value = ripA.texture;
+      blit(ripOutMat, ripOut);
+    }
+
+    // ------------------------------------------------------------------
     //  Water
     // ------------------------------------------------------------------
     function buildWaterGeometry() {
       const rings = [];
-      for (let r = 0; r <= 460; r += 3) rings.push(r);
-      let r = 460; while (r < 42000) { r *= 1.04; rings.push(Math.min(r, 42000)); }
-      const ANG = isMobile ? 256 : 384;
+      // only the long swell displaces vertices (shortest wavelength ~74 units), so the grid can be coarse
+      for (let r = 0; r <= 460; r += 5) rings.push(r);
+      let r = 460; while (r < 42000) { r *= 1.06; rings.push(Math.min(r, 42000)); }
+      const ANG = TIER === 0 ? 192 : 256;
       const pos = [], ind = [];
       for (let i = 0; i < rings.length; i++) for (let a = 0; a < ANG; a++) {
         const th = a / ANG * Math.PI * 2; pos.push(Math.cos(th) * rings[i], 0, Math.sin(th) * rings[i]);
@@ -1047,29 +1393,30 @@
     }
 
     const mirrorTexMatrix = new THREE.Matrix4();
+    const rotGLSL = (a) => `mat2(${Math.cos(a).toFixed(7)}, ${Math.sin(a).toFixed(7)}, ${(-Math.sin(a)).toFixed(7)}, ${Math.cos(a).toFixed(7)})`;
     const waterMat = new THREE.ShaderMaterial({
       uniforms: {
+        ...skyU,
         uTime: { value: 0 },
+        uTimeS: { value: 0 },
         uSwellA: { value: swell.map(s => new THREE.Vector4(s.dx, s.dz, s.k, s.amp)) },
         uSwellB: { value: swell.map(s => new THREE.Vector4(s.w, s.ph, s.q, 0)) },
         tWave0: { value: CASCADES[0].out.texture },
         tWave1: { value: CASCADES[1].out.texture },
         tWave2: { value: CASCADES[2].out.texture },
         uCasc: { value: new THREE.Vector3(...CASCADES.map(c => c.L)) },
-        uRot: { value: new THREE.Vector3(...CASCADES.map(c => c.rot)) },
-        uDuckA: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
-        uDuckB: { value: Array.from({ length: DUCKS }, () => new THREE.Vector4()) },
+        tRipple: { value: ripOut.texture },
         uMirrorMatrix: { value: mirrorTexMatrix },
         tRefl: { value: null },
         tRefr: { value: null },
         tRefrDepth: { value: null },
-        uSky: { value: cubeRT.texture },
         uNoise: { value: noiseRT.texture },
         uSun: { value: sunDir },
         uSunE: { value: new THREE.Vector3() },
         uSunVis: { value: 1 },
         uAmb: { value: new THREE.Vector3() },
         uRes: { value: new THREE.Vector2() },
+        uPix: { value: 0.001 },
         uNear: { value: camera.near },
         uFar: { value: camera.far }
       },
@@ -1108,14 +1455,10 @@
         precision highp float;
         precision highp sampler3D;
         #include <packing>
-        #define DUCKS ${DUCKS}
-        uniform float uTime, uSunVis, uNear, uFar;
-        uniform sampler2D tWave0, tWave1, tWave2;
-        uniform vec3 uCasc, uRot;
-        uniform vec4 uDuckA[DUCKS];
-        uniform vec4 uDuckB[DUCKS];
+        uniform float uTime, uTimeS, uSunVis, uNear, uFar, uPix;
+        uniform sampler2D tWave0, tWave1, tWave2, tRipple;
+        uniform vec3 uCasc;
         uniform sampler2D tRefl, tRefr, tRefrDepth;
-        uniform samplerCube uSky;
         uniform sampler3D uNoise;
         uniform vec3 uSun, uSunE, uAmb;
         uniform vec2 uRes;
@@ -1123,12 +1466,19 @@
         varying vec4 vMirror;
         varying vec2 vSwellSlope;
         varying float vViewZ;
+        ${SKY_GLSL}
+        const mat2 R0 = ${rotGLSL(CASCADES[0].rot)}, R1 = ${rotGLSL(CASCADES[1].rot)}, R2 = ${rotGLSL(CASCADES[2].rot)};
 
         float D_GGX(float NH, float a2) { float d = NH * NH * (a2 - 1.0) + 1.0; return a2 / (3.14159 * d * d); }
         float V_Smith(float NV, float NL, float a2) {
           float gv = NL * sqrt(NV * NV * (1.0 - a2) + a2);
           float gl = NV * sqrt(NL * NL * (1.0 - a2) + a2);
           return 0.5 / max(gv + gl, 1e-5);
+        }
+        vec2 hash22(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.xx + p3.yz) * p3.zy);
         }
 
         void main() {
@@ -1138,48 +1488,25 @@
           vec3 V = toCam / dist;
 
           // ---- wind waves from the FFT cascades (mip/aniso filtered, variance -> roughness)
-          float gust = texture(uNoise, vec3(xz * 0.0011 + vec2(uTime * 0.0022, uTime * 0.0013), 0.13 + uTime * 0.0007)).r;
+          float gust = texture(uNoise, vec3(xz * 0.0011 + uTimeS * vec2(0.00216666667, 0.00133333333), 0.13 + uTimeS * 0.00066666667)).r;
           gust = 0.45 + 1.2 * smoothstep(0.15, 0.85, gust);
           vec2 ws = vec2(0.0);
           float variance = 0.0;
           {
-            vec4 c;
-            mat2 r;
-            r = mat2(cos(uRot.x), sin(uRot.x), -sin(uRot.x), cos(uRot.x));
-            c = texture(tWave0, (r * xz) / uCasc.x);
-            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
-            r = mat2(cos(uRot.y), sin(uRot.y), -sin(uRot.y), cos(uRot.y));
-            c = texture(tWave1, (r * xz) / uCasc.y);
-            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
-            r = mat2(cos(uRot.z), sin(uRot.z), -sin(uRot.z), cos(uRot.z));
-            c = texture(tWave2, (r * xz) / uCasc.z);
-            ws += transpose(r) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
+            vec4 c = texture(tWave0, (R0 * xz) / uCasc.x);
+            ws += transpose(R0) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
+            c = texture(tWave1, (R1 * xz) / uCasc.y);
+            ws += transpose(R1) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
+            c = texture(tWave2, (R2 * xz) / uCasc.z);
+            ws += transpose(R2) * c.xy; variance += max(c.z + c.w - dot(c.xy, c.xy), 0.0);
           }
           vec2 slope = vSwellSlope + ws * gust;
           variance *= gust * gust;
 
-          // ---- ripples shed by the bobbing ducks, plus contact shading
-          float contact = 0.0;
-          for (int j = 0; j < DUCKS; j++) {
-            vec4 d = uDuckA[j];
-            vec2 rel = xz - d.xy;
-            float r2 = dot(rel, rel);
-            float R = 3.4 * d.w;
-            if (r2 > (R + 18.0) * (R + 18.0)) continue;
-            float c = cos(d.z), s = sin(d.z);
-            vec2 loc = vec2(rel.x * c - rel.y * s, rel.x * s + rel.y * c) / d.w;
-            float e = length(loc / vec2(2.55, 3.25));
-            float edge = (e - 1.0) * 2.9 * d.w;
-            if (edge < -0.5) continue;
-            edge = max(edge, 0.0);
-            vec4 db = uDuckB[j];
-            // kept faint and short-lived so the wind texture on the water stays dominant
-            float amp = (0.014 + 0.07 * clamp(abs(db.x), 0.0, 1.0)) * exp(-edge / 4.5);
-            float ph = edge * 1.5 - uTime * 3.6 + db.y;
-            vec2 radial = rel / max(sqrt(r2), 1e-3);
-            slope += radial * amp * cos(ph) * smoothstep(0.0, 0.6, edge);
-            contact += exp(-edge / 1.1);
-          }
+          // ---- rings shed by the ducks (simulated), plus contact shading at the hulls
+          vec4 rp = texture(tRipple, xz / ${RIP_L}.0 + 0.5);
+          slope += rp.xy;
+          float contact = rp.z;
 
           vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
           float NV = max(dot(N, V), 1e-3);
@@ -1198,7 +1525,8 @@
           if (zs < vViewZ) { ruv = suv; zs = -perspectiveDepthToViewZ(texture(tRefrDepth, ruv).x, uNear, uFar); }
           float thick = max(zs - vViewZ, 0.0) * dist / max(vViewZ, 1e-3);
           vec3 trans = exp(-vec3(0.55, 0.16, 0.12) * thick);
-          vec3 scatter = vec3(0.004, 0.022, 0.020) * (uAmb * 2.2 + uSunE * 0.03);
+          // light scattered back up out of the water body: sky-lit, plus a sun-lit teal
+          vec3 scatter = vec3(0.0045, 0.026, 0.025) * (uAmb * 2.5 + uSunE * uSunVis * 0.035);
           vec3 under = texture(tRefr, ruv).rgb * trans + scatter * (1.0 - trans);
 
           // ---- Fresnel blend
@@ -1214,11 +1542,24 @@
           float VH = max(dot(V, H), 0.0);
           float Fs = 0.02 + 0.98 * pow(1.0 - VH, 5.0);
           vec3 spec = uSunE * uSunVis * D_GGX(NH, a2) * V_Smith(NV, NL, a2) * Fs * NL;
+          // Past the range where single facets resolve, real glitter is thousands of brief glints.
+          // A lattice fixed in (azimuth, depression) around the camera gives every ~3x1.4 pixel
+          // cell its own slow flash; the mean is 1, so the path keeps its energy but sparkles.
+          {
+            vec2 cr = xz - cameraPosition.xz;
+            vec2 gq = vec2(atan(cr.y, cr.x) / (uPix * 3.0), cameraPosition.y / max(length(cr), 1.0) / (uPix * 1.4));
+            vec2 gh = hash22(floor(gq));
+            float fl = max(sin(gh.x * 6.2831853 + uTime * (1.5 + 3.0 * gh.y)), 0.0);
+            fl *= fl; fl *= fl; fl *= fl;                 // sin^8: on for roughly a fifth of the cycle
+            vec2 gf = abs(fract(gq) - 0.5);
+            float dot_ = smoothstep(0.5, 0.25, max(gf.x, gf.y));
+            spec *= mix(1.0, fl * dot_ * 12.0, 0.62 * smoothstep(70.0, 260.0, dist));
+          }
           col += min(spec, vec3(3000.0));
 
           // ---- aerial perspective toward the horizon
           float haze = 1.0 - exp(-dist * 0.00011);
-          vec3 hz = texture(uSky, normalize(vec3(-V.x, 0.004, -V.z))).rgb;
+          vec3 hz = skyAt(normalize(vec3(-V.x, 0.004, -V.z))).rgb;
           col = mix(col, hz, haze);
 
           gl_FragColor = vec4(col, 1.0);
@@ -1263,64 +1604,72 @@
     }
 
     // ------------------------------------------------------------------
-    //  Post: depth of field -> bloom -> lens/film composite
+    //  Post: half-res depth of field -> bloom -> lens/film composite.
+    //  Only two passes ever touch full resolution: the scene itself and the composite.
     // ------------------------------------------------------------------
-    const dofMat = new THREE.ShaderMaterial({
-      uniforms: {
-        tColor: { value: null }, tDepth: { value: null },
-        uNear: { value: camera.near }, uFar: { value: camera.far },
-        uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 },
-        uRes: { value: new THREE.Vector2() }, uExposure: { value: params.has('ev') ? parseFloat(params.get('ev')) : 0.72 }
-      },
-      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    // 1. half-res colour with linear depth in alpha, so the gather reads a single texture
+    const dofPreMat = new THREE.ShaderMaterial({
+      uniforms: { tColor: { value: null }, tDepth: { value: null }, uNear: { value: camera.near }, uFar: { value: camera.far } },
+      vertexShader: fsVS,
       fragmentShader: /* glsl */`
         #include <packing>
         varying vec2 vUv;
         uniform sampler2D tColor, tDepth;
-        uniform float uNear, uFar, uFocus, uAperture, uMaxCoc, uExposure;
+        uniform float uNear, uFar;
+        void main() {
+          float z = -perspectiveDepthToViewZ(texture(tDepth, vUv).x, uNear, uFar);
+          gl_FragColor = vec4(texture(tColor, vUv).rgb, min(z, 60000.0));
+        }`
+    });
+    // 2. bokeh gather; alpha returns the blur radius that actually reached this pixel, so
+    //    out-of-focus foreground can spill over sharp background in the composite
+    const dofMat = new THREE.ShaderMaterial({
+      uniforms: { tHalf: { value: null }, uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 }, uRes: { value: new THREE.Vector2() } },
+      vertexShader: fsVS,
+      fragmentShader: /* glsl */`
+        varying vec2 vUv;
+        uniform sampler2D tHalf;
+        uniform float uFocus, uAperture, uMaxCoc;
         uniform vec2 uRes;
-        float lin(vec2 uv) { return -perspectiveDepthToViewZ(texture(tDepth, uv).x, uNear, uFar); }
         float coc(float z) { return min(uAperture * abs(z - uFocus) / max(z, 1e-3), uMaxCoc); }
         void main() {
-          float zc = lin(vUv);
-          float cc = coc(zc);
-          vec3 acc = texture(tColor, vUv).rgb;
-          float wsum = 1.0;
-          const int N = 40;
+          vec4 c0 = texture(tHalf, vUv);
+          float zc = c0.a, cc = coc(zc);
+          vec3 acc = c0.rgb;
+          float wsum = 1.0, csum = cc;
+          const int N = ${Q.dof};
           for (int i = 0; i < N; i++) {
             float fi = float(i) + 0.5;
             float r = sqrt(fi / float(N)) * uMaxCoc;
             float th = fi * 2.39996323;
-            vec2 o = vec2(cos(th), sin(th)) * r;
-            vec2 uv = vUv + o / uRes;
-            float zs = lin(uv);
-            float cs = coc(zs);
-            if (zs > zc) cs = min(cs, cc * 1.5 + 0.5);
+            vec4 s = texture(tHalf, vUv + vec2(cos(th), sin(th)) * r / uRes);
+            float cs = coc(s.a);
+            if (s.a > zc) cs = min(cs, cc * 1.5 + 0.5);
             float w = smoothstep(r - 1.0, r + 0.5, cs);
-            vec3 s = texture(tColor, uv).rgb;
             // bokeh: favour bright taps a little so highlights bloom into discs
-            w *= 1.0 + 0.25 * min(dot(s, vec3(0.3, 0.6, 0.1)), 20.0) * step(1.5, cs);
-            acc += s * w; wsum += w;
+            w *= 1.0 + 0.25 * min(dot(s.rgb, vec3(0.3, 0.6, 0.1)), 20.0) * step(1.5, cs);
+            acc += s.rgb * w; wsum += w; csum += cs * w;
           }
-          gl_FragColor = vec4(acc / wsum * uExposure, 1.0);
+          gl_FragColor = vec4(acc / wsum, csum / wsum);
         }`
     });
-    const dofQuad = new FullScreenQuad(dofMat);
 
+    // 3. lens + film
     const compMat = new THREE.ShaderMaterial({
       uniforms: {
-        tColor: { value: null }, tBloom: { value: null }, tDepth: { value: null }, uBloom: { value: 0.05 },
-        uSky: { value: cubeRT.texture }, uSunDir: { value: sunDir },
+        tColor: { value: null }, tDof: { value: null }, tBloom: { value: null }, tDepth: { value: null },
+        uBloom: { value: 0.05 }, uExposure: { value: 0.72 },
+        uNear: { value: camera.near }, uFar: { value: camera.far },
+        uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 },
         uTime: { value: 0 }, uRes: { value: new THREE.Vector2() },
         uSunUV: { value: new THREE.Vector2() }, uSunVis: { value: 0 }, uSunCol: { value: new THREE.Vector3() }
       },
-      vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+      vertexShader: fsVS,
       fragmentShader: /* glsl */`
+        #include <packing>
         varying vec2 vUv;
-        uniform sampler2D tColor, tBloom, tDepth;
-        uniform samplerCube uSky;
-        uniform vec3 uSunDir;
-        uniform float uTime, uSunVis, uBloom;
+        uniform sampler2D tColor, tDof, tBloom, tDepth;
+        uniform float uTime, uSunVis, uBloom, uExposure, uNear, uFar, uFocus, uAperture, uMaxCoc;
         uniform vec2 uRes, uSunUV;
         uniform vec3 uSunCol;
         float hash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
@@ -1332,14 +1681,21 @@
           float r2 = dot(c * vec2(aspect, 1.0), c * vec2(aspect, 1.0));
           vec2 duv = c * (1.0 + 0.018 * r2);
           vec2 ca = duv * 0.0028 * r2;
+          vec2 u0 = 0.5 + duv;
+
+          // depth of field: the sharp full-res frame where in focus, the half-res gather elsewhere
+          vec4 dg = texture(tDof, u0);
+          float z = -perspectiveDepthToViewZ(texture(tDepth, u0).x, uNear, uFar);
+          float cc = max(min(uAperture * abs(z - uFocus) / max(z, 1e-3), uMaxCoc), dg.a);
+          float kd = smoothstep(0.6, 2.2, cc);
           vec3 col;
-          col.r = texture(tColor, 0.5 + duv - ca).r;
-          col.g = texture(tColor, 0.5 + duv).g;
-          col.b = texture(tColor, 0.5 + duv + ca).b;
+          col.r = mix(texture(tColor, u0 - ca).r, texture(tDof, u0 - ca).r, kd);
+          col.g = mix(texture(tColor, u0).g, dg.g, kd);
+          col.b = mix(texture(tColor, u0 + ca).b, texture(tDof, u0 + ca).b, kd);
 
           // round bloom (energy conserving mix; the mip chain sums 7 levels)
-          vec3 bl = texture(tBloom, 0.5 + duv).rgb / 7.0;
-          col = mix(col, bl, uBloom);
+          vec3 bl = texture(tBloom, u0).rgb / 7.0;
+          col = mix(col, bl, uBloom) * uExposure;
 
           // how much of the sun is actually visible: cloud transmittance x unoccluded by ducks
           float vis = 0.0;
@@ -1349,7 +1705,7 @@
               vec2 o = vec2(float(i - 2) * 0.004, float((i * 3) % 5 - 2) * 0.004);
               clear += step(0.99999, texture(tDepth, uSunUV + o).x);
             }
-            vis = uSunVis * (clear / 5.0) * texture(uSky, uSunDir).a;
+            vis = uSunVis * (clear / 5.0);
           }
 
           // circular sun glare (veiling glare of the lens), aspect-correct
@@ -1393,7 +1749,6 @@
           gl_FragColor.rgb += n * mix(0.035, 0.012, l);
         }`
     });
-    const compQuad = new FullScreenQuad(compMat);
 
     // ------------------------------------------------------------------
     //  Email overlay (identical to the original page)
@@ -1435,7 +1790,8 @@
     }
     // BASE_EV was tuned for the 0.5 degree sunset; other sun heights are metered relative to it
     const REF_KEY = meterKey([0, Math.sin(THREE.MathUtils.degToRad(0.5)), -Math.cos(THREE.MathUtils.degToRad(0.5))]);
-    let targetExposure = BASE_EV;
+    let targetExposure = BASE_EV, sunLum = 1;
+    const _venus = new THREE.Vector3();
     function updateLighting() {
       const L = [sunDir.x, sunDir.y, sunDir.z];
       const tg = jSunT([0, A.PR + 0.01, 0], L);
@@ -1443,7 +1799,7 @@
       sunE.set(tg[0], tg[1], tg[2]).multiplyScalar(SUN_E);
       sunCloud.set(tc[0], tc[1], tc[2]).multiplyScalar(SUN_E);
       const th = jSunT([0, A.PR + 7.5, 0], L);
-      skyCubeMat.uniforms.uSunHigh.value.set(th[0], th[1], th[2]).multiplyScalar(SUN_E);
+      cloudMat.uniforms.uSunHigh.value.set(th[0], th[1], th[2]).multiplyScalar(SUN_E);
       // average sky radiance over the upper hemisphere
       const acc = [0, 0, 0]; let n = 0;
       for (const el of [0.08, 0.35, 0.8]) for (let a = 0; a < 6; a++) {
@@ -1452,33 +1808,45 @@
         acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2]; n++;
       }
       amb.set(acc[0] / n, acc[1] / n, acc[2] / n);
-      skyCubeMat.uniforms.uSunCloud.value.copy(sunCloud);
-      skyCubeMat.uniforms.uAmb.value.copy(amb);
+      cloudMat.uniforms.uSunCloud.value.copy(sunCloud);
+      cloudMat.uniforms.uAmb.value.copy(amb);
+      // brightness key for the time-sliced cloud tiles (see SKY_GLSL)
+      const key0 = Math.max(luma(sunCloud) * 0.25 + luma(amb), 1e-4);
+      cloudMat.uniforms.uKey.value = key0;
+      skyU.uSkyKey.value = key0;
+      envMat.uniforms.uAmb.value.copy(amb);
       waterMat.uniforms.uSunE.value.copy(sunE);
       waterMat.uniforms.uAmb.value.copy(amb);
-      const lum = Math.max(sunE.x, sunE.y, sunE.z, 1e-6);
-      sunLight.color.setRGB(sunE.x / lum, sunE.y / lum, sunE.z / lum, THREE.LinearSRGBColorSpace);
-      sunLight.intensity = lum;
+      sunLum = Math.max(sunE.x, sunE.y, sunE.z, 1e-6);
+      sunLight.color.setRGB(sunE.x / sunLum, sunE.y / sunLum, sunE.z / sunLum, THREE.LinearSRGBColorSpace);
       const omega = 2 * Math.PI * (1 - Math.cos(SUN_ANG));
       skyDomeMat.uniforms.uSunDisk.value.copy(sunE).multiplyScalar(1 / omega).clampScalar(0, 40000);
-      if (vinyl.userData.shader) vinyl.userData.shader.uniforms.uSunColV.value.copy(sunE);
       compMat.uniforms.uSunCol.value.copy(sunE);
       // auto exposure: meter on direct sun + sky light, like a camera in program mode
       const key = luma(sunE) * 0.25 + luma(amb);
       // (the gain is capped so dusk reads as dusk instead of being pumped back to daylight)
       targetExposure = BASE_EV * THREE.MathUtils.clamp(Math.pow(REF_KEY / Math.max(key, 1e-5), 0.55), 0.2, 6.0);
+      // the low sun is squashed by refraction; stars and the evening star come out as it leaves
+      const elDeg = THREE.MathUtils.radToDeg(SUN_ELEV);
+      skyDomeMat.uniforms.uSquash.value = THREE.MathUtils.lerp(0.84, 1.0, THREE.MathUtils.smoothstep(elDeg, -1.0, 7.0));
+      const la = luma(amb);
+      skyDomeMat.uniforms.uStars.value = (1 - THREE.MathUtils.smoothstep(elDeg, -3.2, 0.6)) * la * STAR_GAIN;
+      _venus.setFromSphericalCoords(1, Math.PI / 2 - deg(17), sunTheta + 0.42);
+      skyDomeMat.uniforms.uVenus.value.set(_venus.x, _venus.y, _venus.z, (1 - THREE.MathUtils.smoothstep(elDeg, -2.0, 2.0)) * la * STAR_GAIN * 9.0);
     }
+    const STAR_GAIN = params.has('stars') ? parseFloat(params.get('stars')) : 30.0;
     function setSun() {
       sunDir.setFromSphericalCoords(1, Math.PI / 2 - SUN_ELEV, sunTheta);
-      skyCubeMat.uniforms.uSun.value.copy(sunDir);
+      skyU.uSunAz.value.set(sunDir.x, sunDir.z).normalize();
+      cloudMat.uniforms.uSun.value.copy(sunDir);
     }
-    setSun();
-    updateLighting();
-    dofMat.uniforms.uExposure.value = targetExposure;
-
-    // prime the cubemap + environment
-    for (let i = 0; i < 6; i++) renderCubeFace(i);
-    rebuildEnv();
+    // direct sunlight follows the cloud cover in front of the disc (never fully: thin cloud still glows)
+    function applySunVis() {
+      const sv = 0.3 + 0.7 * sunVis;
+      sunLight.intensity = sunLum * sv;
+      waterMat.uniforms.uSunVis.value = 0.12 + 0.88 * sunVis;
+      if (vinyl.userData.shader) vinyl.userData.shader.uniforms.uSunColV.value.copy(sunE).multiplyScalar(sv);
+    }
 
     // ------------------------------------------------------------------
     //  Simulation
@@ -1490,6 +1858,7 @@
         renderer.domElement.addEventListener(evt, () => { hasInteracted = true; }, { once: true }));
     }, 2000);
 
+    const RING_DRIVE = 0.55 * RIP_GAIN;
     const _m = new THREE.Matrix4(), _p = new THREE.Vector3(), _s = new THREE.Vector3(), _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion(), _up = new THREE.Vector3(0, 1, 0), _nrm = new THREE.Vector3();
     function updateDucks(t, dt) {
       const f = dt * 60;
@@ -1526,41 +1895,119 @@
         _qa.multiply(_qb);
         _m.compose(_p.set(d.x, d.y, d.z), _qa, _s.setScalar(d.s));
         duckMesh.setMatrixAt(i, _m);
-        eyeMesh.setMatrixAt(i, _m);
-        waterMat.uniforms.uDuckA.value[i].set(d.x, d.z, d.yaw, d.s);
-        waterMat.uniforms.uDuckB.value[i].set(d.vy, d.wob * 3.0, 0, 0);
+        // what the ripple simulation needs: the hull, how hard it is bobbing, and where it is heading
+        duckA[i].set(d.x, d.z, d.yaw, d.s);
+        // (the bow-wave term is capped so a duck sent flying by a collision trails a wake, not a wall)
+        const sp = Math.hypot(d.driftX, d.driftZ) * 60, bow = RIP_GAIN * 60 * Math.min(1, 3 / Math.max(sp, 1e-3));
+        duckB[i].set(RING_DRIVE * (0.4 + 2.0 * Math.min(Math.abs(d.vy), 1)) * Math.sin(d.rw * t + d.rp), 0, d.driftX * bow, d.driftZ * bow);
       }
       duckMesh.instanceMatrix.needsUpdate = true;
-      eyeMesh.instanceMatrix.needsUpdate = true;
     }
 
     // smooth value noise for a hand-held camera feel
     const shake = (t, s) => Math.sin(t * 0.71 + s) * 0.5 + Math.sin(t * 1.37 + s * 2.1) * 0.3 + Math.sin(t * 2.93 + s * 3.7) * 0.2;
 
     // ------------------------------------------------------------------
+    //  Frame-time governor. GPU time comes from a timer query where the
+    //  browser offers one; otherwise from the frame interval, with an
+    //  occasional careful probe back up the ladder.
+    // ------------------------------------------------------------------
+    const tqExt = (adaptive || params.has('hud')) ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
+    let tq = null, gpuMs = 0, gpuSamples = 0;
+    const tqPending = [];
+    function gpuBegin() {
+      if (!tqExt || tq || tqPending.length > 3) return;
+      tq = gl.createQuery(); gl.beginQuery(tqExt.TIME_ELAPSED_EXT, tq);
+    }
+    function gpuEnd() {
+      if (!tq) return;
+      gl.endQuery(tqExt.TIME_ELAPSED_EXT); tqPending.push(tq); tq = null;
+    }
+    function gpuPoll() {
+      while (tqPending.length && gl.getQueryParameter(tqPending[0], gl.QUERY_RESULT_AVAILABLE)) {
+        const q = tqPending.shift();
+        if (!gl.getParameter(tqExt.GPU_DISJOINT_EXT)) {
+          const ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+          gpuMs = gpuSamples ? gpuMs * 0.88 + ms * 0.12 : ms; gpuSamples++;
+        }
+        gl.deleteQuery(q);
+      }
+    }
+    const gov = { frames: 0, acc: 0, spikes: 0, hold: 3, probeAt: Infinity, probeDelay: 20, probing: 0, before: 0, noGain: 0, lastGood: 0, locked: false, avg: 0 };
+    function setLevel(n, now) {
+      level = THREE.MathUtils.clamp(n, 0, LADDER.length - 1);
+      renderScale = LADDER[level].scale; msaa = LADDER[level].msaa;
+      resize();
+      gov.hold = now + 1.5; gov.frames = 0; gov.acc = 0; gpuMs = 0; gpuSamples = 0;
+    }
+    function govern(rawDt) {
+      const now = performance.now() / 1000;
+      if (document.hidden) { gov.frames = 0; gov.acc = 0; gov.hold = Math.max(gov.hold, now + 0.5); return; }
+      // an isolated long frame is a hitch (tab switch, GC, shader compile) and is ignored;
+      // several in a row are simply how slow this machine is
+      gov.spikes = rawDt > 0.25 ? gov.spikes + 1 : 0;
+      if (gov.spikes > 0 && gov.spikes < 3) { gov.frames = 0; gov.acc = 0; return; }
+      if (now < gov.hold) return;
+      gov.frames++; gov.acc += Math.min(rawDt, 1);
+      if (gov.acc < 1.0 || (gov.frames < 10 && gov.acc < 2.5)) return;
+      const avg = gov.avg = gov.acc / gov.frames * 1000;
+      gov.frames = 0; gov.acc = 0;
+      const timed = gpuSamples > 8;
+      const slow = timed ? (gpuMs > 15 || avg > 25) : avg > 21.5;
+      const fast = timed && gpuMs < 8.5 && avg < 19.5;
+      // stepping down that buys nothing means the frame rate is capped elsewhere (battery saver,
+      // a 30 Hz display, a busy main thread): give the quality back and stop chasing it
+      if (gov.before) {
+        if (avg > gov.before * 0.93) gov.noGain++; else { gov.noGain = 0; gov.lastGood = level; }
+        gov.before = 0;
+        if (gov.noGain >= 2 && !timed) { gov.locked = true; setLevel(gov.lastGood, now); return; }
+      }
+      if (slow && !gov.locked && level < LADDER.length - 1) {
+        if (now < gov.probing) gov.probeDelay = Math.min(gov.probeDelay * 2, 300);   // the last probe was too optimistic
+        gov.before = avg;
+        setLevel(level + ((timed ? gpuMs > 28 : avg > 42) ? 2 : 1), now);
+        gov.probeAt = now + gov.probeDelay;
+      } else if (level > 0 && !gov.locked && (fast || (!timed && now > gov.probeAt && avg < 18.5))) {
+        setLevel(level - 1, now);
+        gov.probing = now + 8; gov.probeAt = now + gov.probeDelay;
+      }
+    }
+
+    let hud = null, hudAt = 0;
+    if (params.has('hud')) {
+      hud = document.createElement('div');
+      hud.style.cssText = 'position:fixed;top:6px;left:8px;z-index:4;color:#fff;font:11px/1.45 monospace;white-space:pre;text-shadow:0 0 3px #000;pointer-events:none;opacity:.85';
+      document.body.appendChild(hud);
+    }
+
+    // ------------------------------------------------------------------
     //  Frame
     // ------------------------------------------------------------------
     const clock = new THREE.Clock();
-    let simTime = 0, lastEnv = 0, lastLight = 0, focus = 100;
-    let frames = 0, ftAcc = 0, lastAdapt = 0, started = false;
+    const ENV_PERIOD = 1.5;
+    let simTime = 0, lastEnv = 0, focus = 100, started = false;
     const _sp = new THREE.Vector3();
 
     function frame(fixedDt) {
       if (!CAPTURE) requestAnimationFrame(frame);
-      const dt = CAPTURE ? fixedDt : Math.min(clock.getDelta(), 0.1);
-      simTime += dt;
-      const t = simTime;
+      const rawDt = CAPTURE ? fixedDt : clock.getDelta();
+      const dt = Math.min(rawDt, 0.1);
+      simTime += dt; frameNo++;
+      const t = simTime, tLoop = t % LOOP;
+      if (tqExt) { gpuPoll(); gpuBegin(); }
 
       // sun drifts sideways exactly like the original (per-frame rate converted to seconds),
-      // and now also slowly sets and rises
+      // and slowly sets and rises
       sunTheta += 0.000035 * 60 * dt;
       SUN_ELEV = sunElevation(t);
       setSun();
-      if (t - lastLight > 0.5) { updateLighting(); lastLight = t; }
+      if (CAPTURE || frameNo % 4 === 1) updateLighting();
       { // eye-like exposure adaptation
-        const u = dofMat.uniforms.uExposure;
+        const u = compMat.uniforms.uExposure;
         u.value += (targetExposure - u.value) * (CAPTURE ? 1 : 1 - Math.exp(-dt * 1.5));
       }
+      sunVis += (sunVisTarget - sunVis) * (CAPTURE ? 1 : 1 - Math.exp(-dt * 2.5));
+      applySunVis();
 
       updateDucks(t, dt);
 
@@ -1581,84 +2028,94 @@
       sunLight.target.position.set(0, 0, 0);
       sunLight.target.updateMatrixWorld();
 
-      // 1. sky/cloud cubemap: one face per frame; refresh image-based lighting periodically
-      skyCubeMat.uniforms.uTime.value = t;
-      renderCubeFace(cubeFace);
-      cubeFace = (cubeFace + 1) % 6;
-      if (t - lastEnv > 2.0 && cubeFace === 0) { rebuildEnv(); lastEnv = t; }
+      // 1. sky: refresh the LUT, a few cloud tiles, and (in two small steps) the image-based lighting
+      if (CAPTURE || frameNo % 3 === 1) renderSkyLut();
+      cloudMat.uniforms.uTime.value = t;
+      weighTiles();
+      tileBudget = Math.min(tileBudget + Q.tiles * LADDER[level].tiles, 4);
+      while (tileBudget >= 1) { renderTile(pickTile()); tileBudget -= 1; }
+      if (envStage === 1) { rebuildEnv(); envStage = 0; }
+      else if (t - lastEnv > ENV_PERIOD) { renderEnvCube(); envStage = 1; lastEnv = t; }
+      scene.environmentIntensity = skyU.uSkyKey.value / envKey;
+      if (CAPTURE || frameNo % 6 === 2) probeSunVis();
 
-      // 2. reflection
-      waterMat.uniforms.uTime.value = t;
-      updateOcean(t);
+      // 2. water: FFT wind waves and the duck-ripple simulation
+      updateOcean(tLoop);
+      stepRipples(dt);
+
+      // 3. shadow map + planar reflection, both with the light duck meshes
+      renderer.getDrawingBufferSize(size);
+      const pix = 2 * Math.tan(deg(camera.fov / 2)) / size.y;
+      waterMat.uniforms.uTime.value = tLoop;
+      waterMat.uniforms.uTimeS.value = t % 6000;
+      waterMat.uniforms.uPix.value = pix;
+      skyDomeMat.uniforms.uPix.value = pix;
+      skyDomeMat.uniforms.uTime.value = tLoop;
       updateMirror();
       water.visible = false;
+      showLod(true);
       skyDomeMat.uniforms.uNoSun.value = 1;
-      renderer.shadowMap.needsUpdate = true;
+      renderer.shadowMap.needsUpdate = TIER > 0 || frameNo % 2 === 1 || CAPTURE;
       renderer.setRenderTarget(reflRT);
       renderer.render(scene, mirrorCam);
 
-      // 3. refraction (ducks only)
+      // 4. refraction (ducks only)
       camera.layers.set(1);
       renderer.setClearColor(0x000000, 0);
       renderer.setRenderTarget(refrRT);
-      renderer.clear();
       renderer.render(scene, camera);
       camera.layers.set(0);
       renderer.setClearColor(0x000000, 1);
       water.visible = true;
+      showLod(false);
       skyDomeMat.uniforms.uNoSun.value = 0;
 
-      // 4. main HDR pass
-      renderer.getDrawingBufferSize(size);
+      // 5. main HDR pass
       waterMat.uniforms.tRefl.value = reflRT.texture;
       waterMat.uniforms.tRefr.value = refrRT.texture;
       waterMat.uniforms.tRefrDepth.value = refrRT.depthTexture;
       waterMat.uniforms.uRes.value.copy(size);
-      // sun visibility through clouds (for the glitter path and lens flare)
       renderer.setRenderTarget(sceneRT);
       renderer.render(scene, camera);
 
-      // 5. depth of field with a slow "autofocus" on the duck flock
+      // 6. depth of field at half resolution, with a slow "autofocus" on the duck flock
       const want = camera.position.distanceTo(controls.target);
       focus = CAPTURE ? want : focus + (want - focus) * (1 - Math.exp(-dt * 2.0));
-      const res = size.y / 1080;
-      dofMat.uniforms.tColor.value = sceneRT.texture;
-      dofMat.uniforms.tDepth.value = sceneRT.depthTexture;
+      const res = size.y / 1080, aperture = 2.6 * res, maxCoc = Math.max(1.0, 6.5 * res);
+      dofPreMat.uniforms.tColor.value = sceneRT.texture;
+      dofPreMat.uniforms.tDepth.value = sceneRT.depthTexture;
+      blit(dofPreMat, dofA);
+      dofMat.uniforms.tHalf.value = dofA.texture;
       dofMat.uniforms.uFocus.value = focus;
-      dofMat.uniforms.uAperture.value = 2.6 * res;
-      dofMat.uniforms.uMaxCoc.value = Math.max(1.0, 6.5 * res);
+      dofMat.uniforms.uAperture.value = aperture;
+      dofMat.uniforms.uMaxCoc.value = maxCoc;
       dofMat.uniforms.uRes.value.copy(size);
-      renderer.setRenderTarget(dofRT);
-      dofQuad.render(renderer);
+      blit(dofMat, dofB);
 
-      // 6. bloom
-      compMat.uniforms.tBloom.value = bloom.render(renderer, dofRT.texture, size.x, size.y);
-      compMat.uniforms.tDepth.value = sceneRT.depthTexture;
+      // 7. bloom
+      const cu = compMat.uniforms;
+      cu.tBloom.value = bloom.render(dofB.texture, size.x, size.y, cu.uExposure.value);
 
-      // 7. lens + film composite to screen
+      // 8. lens + film composite to screen
       _sp.copy(sunDir).multiplyScalar(1000).add(camera.position).project(camera);
       const onScreen = _sp.z < 1 && Math.abs(_sp.x) < 1.2 && Math.abs(_sp.y) < 1.2;
-      compMat.uniforms.uSunUV.value.set(_sp.x * 0.5 + 0.5, _sp.y * 0.5 + 0.5);
-      compMat.uniforms.uSunVis.value = onScreen ? Math.max(0, 1 - Math.hypot(_sp.x * camera.aspect, _sp.y) / (1.3 * camera.aspect)) : 0;
-      compMat.uniforms.uTime.value = t;
-      compMat.uniforms.tColor.value = dofRT.texture;
-      compMat.uniforms.uRes.value.copy(size);
-      renderer.setRenderTarget(null);
-      compQuad.render(renderer);
+      cu.uSunUV.value.set(_sp.x * 0.5 + 0.5, _sp.y * 0.5 + 0.5);
+      cu.uSunVis.value = onScreen ? Math.max(0, 1 - Math.hypot(_sp.x * camera.aspect, _sp.y) / (1.3 * camera.aspect)) * sunVis : 0;
+      cu.uTime.value = tLoop;
+      cu.tColor.value = sceneRT.texture;
+      cu.tDof.value = dofB.texture;
+      cu.tDepth.value = sceneRT.depthTexture;
+      cu.uFocus.value = focus; cu.uAperture.value = aperture; cu.uMaxCoc.value = maxCoc;
+      cu.uRes.value.copy(size);
+      blit(compMat, null);
+      if (tqExt) gpuEnd();
 
       if (!started) { started = true; requestAnimationFrame(() => document.getElementById('curtain').classList.add('gone')); }
-
-      // adaptive resolution
-      if (adaptive && !CAPTURE) {
-        frames++; ftAcc += dt;
-        if (t - lastAdapt > 3 && frames > 20) {
-          const avg = ftAcc / frames;
-          let next = renderScale;
-          if (avg > 1 / 40 && renderScale > 0.5) next = Math.max(0.5, renderScale - 0.15);
-          else if (avg < 1 / 75 && renderScale < 1) next = Math.min(1, renderScale + 0.1);
-          if (next !== renderScale) { renderScale = next; resize(); }
-          frames = 0; ftAcc = 0; lastAdapt = t;
-        }
+      if (adaptive) govern(rawDt);
+      if (hud && t - hudAt > 0.5) {
+        hudAt = t;
+        hud.textContent = `${gpuName.replace(/^ANGLE \(|\)$/g, '').slice(0, 70)}\ntier ${['low', 'med', 'high'][TIER]}  level ${level}/${LADDER.length - 1}${gov.locked ? ' (locked)' : ''}  ${size.x}x${size.y}  msaa ${msaa}\n` +
+          `frame ${(gov.avg || rawDt * 1000).toFixed(1)} ms  gpu ${gpuSamples ? gpuMs.toFixed(1) + ' ms' : 'n/a'}  sun ${THREE.MathUtils.radToDeg(SUN_ELEV).toFixed(1)}°  vis ${sunVis.toFixed(2)}`;
       }
     }
 
@@ -1672,16 +2129,47 @@
     addEventListener('resize', resize);
     document.addEventListener('visibilitychange', () => clock.getDelta());
 
-    if (CAPTURE) {
-      window.__frame = (dt, n = 1) => { for (let i = 0; i < n; i++) frame(dt); return true; };
-      window.__setTime = (t) => { simTime = t; };
-      window.__setPan = (a) => { autoPanAngle = a; };
-      window.__view = (p, t) => { hasInteracted = true; camera.position.set(...p); controls.target.set(...t); };
-      window.__ducks = ducks; window.__controls = controls;
-      window.__setSun = (th) => { sunTheta = th; };
-      window.__dbg = { renderCubeFace, rebuildEnv, THREE, renderer, scene, camera, skyDome, water, skyDomeMat, mirrorCam, cubeRT, reflRT: () => reflRT, sceneRT: () => sceneRT, skyCubeMat, waterMat, cubeCam, sunDir, amb, sunE };
-      window.__ready = true;
-    } else frame();
+    // ------------------------------------------------------------------
+    //  Boot: everything heavy is spread over a few frames behind the curtain,
+    //  so even a slow GPU never sees one giant job
+    // ------------------------------------------------------------------
+    function refreshSky() {
+      setSun(); updateLighting(); renderSkyLut();
+      for (const tl of tiles) renderTile(tl);
+      renderEnvCube(); rebuildEnv(); envStage = 0;
+      probeSunVis();
+    }
+    async function boot() {
+      const chunk = CAPTURE ? NOISE_SIZE : 16;
+      for (let z = 0; z < NOISE_SIZE; z += chunk) { bakeNoise(z, Math.min(NOISE_SIZE, z + chunk)); if (!CAPTURE) await nextFrame(); }
+      setSun(); updateLighting(); renderSkyLut(); clearCloudCube();
+      let n = 0;
+      for (const tl of tiles) { renderTile(tl); if (!CAPTURE && ++n % 6 === 0) await nextFrame(); }
+      renderEnvCube(); rebuildEnv();
+      probeSunVis();
+      compMat.uniforms.uExposure.value = targetExposure;
+      if (!CAPTURE) {
+        // compile the scene's shaders off the main thread where the driver allows it
+        try {
+          renderer.setRenderTarget(sceneRT);
+          await Promise.race([renderer.compileAsync(scene, camera), new Promise(r => setTimeout(r, 4000))]);
+        } catch (err) { /* compiled lazily instead */ }
+        renderer.setRenderTarget(null);
+        clock.getDelta();
+        frame();
+      } else {
+        window.__frame = (dt, n = 1) => { for (let i = 0; i < n; i++) frame(dt); return true; };
+        window.__setTime = (t) => { simTime = t; SUN_ELEV = sunElevation(t); refreshSky(); };
+        window.__setPan = (a) => { autoPanAngle = a; };
+        window.__view = (p, t) => { hasInteracted = true; camera.position.set(...p); controls.target.set(...t); };
+        window.__setSun = (th) => { sunTheta = th; refreshSky(); };
+        window.__ducks = ducks; window.__controls = controls;
+        window.__spin = (n, dt = 1 / 60) => { for (let i = 0; i < n; i++) { simTime += dt; updateDucks(simTime, dt); stepRipples(dt); } };
+        window.__dbg = { THREE, renderer, scene, camera, tiles, Q, TIER, gpuName, cubeRT, lutRT, ripOut, ripA: () => ripA, sceneRT: () => sceneRT, waterMat, cloudMat, skyDomeMat, compMat, sunDir, amb, sunE, refreshSky, duckGeo, duckGeoLo, eyeGeo, sunVis: () => sunVis };
+        window.__ready = true;
+      }
+    }
+    boot();
   </script>
 </body>
 </html>
