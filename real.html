@@ -52,34 +52,45 @@
       const lose = probe.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
     }
     // 0 = phones / integrated / software, 1 = unknown or mid-range, 2 = discrete & Apple silicon.
-    // This only picks the starting point: the governor below keeps adjusting to the measured frame time.
-    const TIER = (() => {
+    // The GPU name is only a first guess: before the curtain lifts, a few frames are timed end to
+    // end and the tier is moved to what this machine can actually do (see boot), and the governor
+    // keeps adjusting to the measured frame time after that.
+    const tierPinned = params.has('q');
+    let tierCap = 2;
+    let TIER = (() => {
       const named = { low: 0, med: 1, medium: 1, high: 2 }[params.get('q')];
       if (named !== undefined) return named;
       let t = 1;
       if (isMobile || /swiftshader|llvmpipe|software|basic render|mali|adreno|powervr|videocore|vivante/i.test(gpuName)) t = 0;
       else if (/nvidia|geforce|rtx|gtx|quadro|radeon\s*(\(tm\)\s*)?(rx|pro)|\barc\b|apple m\d/i.test(gpuName)) t = 2;
       else if (/intel/i.test(gpuName) && !/iris|\bxe\b/i.test(gpuName)) t = 0;
-      try { const cap = sessionStorage.getItem('realTierCap'); if (cap !== null) t = Math.min(t, +cap); } catch (err) { /* private mode */ }
-      return t;
+      try {
+        // a tier this same GPU measured its way to on an earlier visit beats the name-based guess
+        const seen = JSON.parse(localStorage.getItem('realTier') || 'null');
+        if (seen && seen.gpu === gpuName && seen.tier >= 0 && seen.tier <= 2) t = seen.tier | 0;
+        const cap = sessionStorage.getItem('realTierCap');
+        if (cap !== null) tierCap = THREE.MathUtils.clamp(+cap || 0, 0, 2);
+      } catch (err) { /* private mode */ }
+      return Math.min(t, tierCap);
     })();
-    const Q = [
+    const TIERS = [
       { budget: 1.6e6, dpr: 1.25, msaa: 2, cube: 512, tile: 128, tiles: 1.0, steps: 36, shadow: [2048, 512], soft: false, aniso: 2, env: 128, duck: [40, 24], rip: 384, dof: 12 },
       { budget: 2.6e6, dpr: 1.5, msaa: 4, cube: 768, tile: 192, tiles: 1.5, steps: 48, shadow: [2048, 512], soft: true, aniso: 4, env: 128, duck: [48, 26], rip: 512, dof: 16 },
       { budget: 3.7e6, dpr: 1.75, msaa: 4, cube: 1024, tile: 256, tiles: 2.0, steps: 64, shadow: [4096, 1024], soft: true, aniso: 8, env: 256, duck: [60, 28], rip: 512, dof: 22 }
-    ][TIER];
-
-    if (params.has('msaa')) Q.msaa = parseInt(params.get('msaa')) || 0;
+    ];
+    if (params.has('msaa')) for (const q of TIERS) q.msaa = parseInt(params.get('msaa')) || 0;
+    let Q = TIERS[TIER];
 
     // the governor walks this ladder: resolution first, then cloud refresh rate and MSAA
     const LADDER = [
-      { scale: 1.00, tiles: 1.00, msaa: Q.msaa },
-      { scale: 0.86, tiles: 0.75, msaa: Q.msaa },
-      { scale: 0.74, tiles: 0.50, msaa: Q.msaa },
-      { scale: 0.63, tiles: 0.50, msaa: Math.min(Q.msaa, 2) },
-      { scale: 0.54, tiles: 0.35, msaa: Math.min(Q.msaa, 2) },
+      { scale: 1.00, tiles: 1.00, msaa: 8 },
+      { scale: 0.86, tiles: 0.75, msaa: 8 },
+      { scale: 0.74, tiles: 0.50, msaa: 8 },
+      { scale: 0.63, tiles: 0.50, msaa: 2 },
+      { scale: 0.54, tiles: 0.35, msaa: 2 },
       { scale: 0.46, tiles: 0.25, msaa: 0 }
     ];
+    const msaaFor = (lv) => Math.min(Q.msaa, LADDER[lv].msaa);
     const adaptive = !params.has('scale') && !CAPTURE;
     let level = 0;
     let renderScale = params.has('scale') ? THREE.MathUtils.clamp(parseFloat(params.get('scale')) || 1, 0.25, 1) : 1.0;
@@ -97,7 +108,7 @@
     document.body.appendChild(renderer.domElement);
     const gl = renderer.getContext();
     const floatRT = renderer.extensions.has('EXT_color_buffer_float');
-    const maxAniso = Math.min(params.has('aniso') ? parseFloat(params.get('aniso')) : Q.aniso, renderer.capabilities.getMaxAnisotropy());
+    const aniso = () => Math.min(params.has('aniso') ? parseFloat(params.get('aniso')) : Q.aniso, renderer.capabilities.getMaxAnisotropy());
 
     // a lost context on a struggling GPU comes back one tier lower (at most twice per tab)
     renderer.domElement.addEventListener('webglcontextlost', (e) => {
@@ -385,9 +396,8 @@
     //  about three times as often as the rest; tiles below the horizon are
     //  never touched.
     // ------------------------------------------------------------------
-    const cubeRT = new THREE.WebGLCubeRenderTarget(Q.cube, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
-    skyU.uSky.value = cubeRT.texture;
-    const cubeCam = new THREE.CubeCamera(0.1, 10, cubeRT);
+    let cubeRT = null;
+    const cubeCam = new THREE.CubeCamera(0.1, 10, new THREE.WebGLCubeRenderTarget(1));   // only its six face cameras are used
     cubeCam.coordinateSystem = renderer.coordinateSystem;
     cubeCam.updateCoordinateSystem();
     cubeCam.updateMatrixWorld(true);
@@ -403,6 +413,7 @@
         uSunCloud: { value: new THREE.Vector3() },
         uAmb: { value: new THREE.Vector3() },
         uCoverage: { value: params.has('cov') ? parseFloat(params.get('cov')) : 0.2 },
+        uSteps: { value: Q.steps },
         uSunHigh: { value: new THREE.Vector3() },
         uWind: { value: new THREE.Vector2(0.010, 0.004) },
         uKey: { value: 1 }
@@ -414,6 +425,7 @@
         varying vec3 vDir;
         uniform vec3 uSun, uSunCloud, uSunHigh, uAmb;
         uniform float uTime, uCoverage, uKey;
+        uniform int uSteps;
         uniform vec2 uWind;
         uniform sampler3D uNoise;
         ${ATMO_GLSL}
@@ -476,14 +488,13 @@
           float t1 = raySphere(ro, rd, PR + CT).y;
           if (t0 > 160.0) return vec4(0.0, 0.0, 0.0, 1.0);
           t1 = min(t1, t0 + 26.0);
-          const int N = ${Q.steps};
-          float dt = (t1 - t0) / float(N);
+          float dt = (t1 - t0) / float(uSteps);
           float t = t0 + dt * hash12(gl_FragCoord.xy);
           float mu = dot(rd, uSun);
           vec3 S = vec3(0.0);
           float T = 1.0;
           float tw = 0.0, ww = 0.0;
-          for (int i = 0; i < N; i++) {
+          for (int i = 0; i < uSteps; i++) {
             vec3 p = ro + rd * t;
             float den = cloudDensity(p, true);
             if (den > 0.002) {
@@ -550,9 +561,13 @@
     });
     cubeScene.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), cloudMat));
 
-    const TILES_PER = Q.cube / Q.tile;
-    const tiles = [];
-    {
+    let tiles = [];
+    function buildCloudCube() {
+      if (cubeRT) cubeRT.dispose();
+      cubeRT = new THREE.WebGLCubeRenderTarget(Q.cube, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+      skyU.uSky.value = cubeRT.texture;
+      const TILES_PER = Q.cube / Q.tile;
+      tiles = [];
       const v = new THREE.Vector3();
       for (let f = 0; f < 6; f++) for (let ty = 0; ty < TILES_PER; ty++) for (let tx = 0; tx < TILES_PER; tx++) {
         const dirs = []; let maxY = -1;
@@ -565,6 +580,7 @@
         tiles.push({ f, x: tx * Q.tile, y: ty * Q.tile, c: dirs[4], rad: Math.acos(cosR), last: -1e9, w: 1 });
       }
     }
+    buildCloudCube();
     let frameNo = 0, tileBudget = 0;
     function renderTile(tl) {
       cubeRT.scissor.set(tl.x, tl.y, Q.tile, Q.tile);
@@ -597,8 +613,14 @@
 
     // ---- image-based lighting: a small box-filtered copy of the sky (plus a reflective sea below
     //      the horizon) is what gets prefiltered, so the periodic PMREM rebuild stays cheap
-    const envSrcRT = new THREE.WebGLCubeRenderTarget(Q.env, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
-    const envCam = new THREE.CubeCamera(0.1, 10, envSrcRT);
+    let envSrcRT = null, envCam = null, envRT = null;
+    function buildEnvCube() {
+      if (envSrcRT) envSrcRT.dispose();
+      if (envRT) { envRT.dispose(); envRT = null; }   // the prefiltered target is sized for its source: start over
+      envSrcRT = new THREE.WebGLCubeRenderTarget(Q.env, { type: THREE.HalfFloatType, generateMipmaps: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+      envCam = new THREE.CubeCamera(0.1, 10, envSrcRT);
+    }
+    buildEnvCube();
     const envScene = new THREE.Scene();
     const envMat = new THREE.ShaderMaterial({
       side: THREE.BackSide, depthWrite: false, depthTest: false,
@@ -625,7 +647,7 @@
     });
     envScene.add(new THREE.Mesh(new THREE.BoxGeometry(2, 2, 2), envMat));
     const pmrem = new THREE.PMREMGenerator(renderer);
-    let envRT = null, envKey = 1, envStage = 0;
+    let envKey = 1, envStage = 0;
     function renderEnvCube() { envCam.update(renderer, envScene); envKey = skyU.uSkyKey.value; }
     function rebuildEnv() {
       envRT = pmrem.fromCubemap(envSrcRT.texture, envRT);
@@ -830,9 +852,13 @@
     }
     const fftRT = () => new THREE.WebGLRenderTarget(3 * FFT_N, FFT_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false, generateMipmaps: false });
     let fftPing = fftRT(), fftPong = fftRT();
-    for (const c of CASCADES) {
-      c.out = new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, anisotropy: maxAniso });
+    function buildWaveTargets() {
+      for (const c of CASCADES) {
+        if (c.out) c.out.dispose();
+        c.out = new THREE.WebGLRenderTarget(FFT_N, FFT_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, wrapS: THREE.RepeatWrapping, wrapT: THREE.RepeatWrapping, anisotropy: aniso() });
+      }
     }
+    buildWaveTargets();
     const fftVS = `void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }`;
     // spectrum at time t, fused with the first (twiddle-free) butterfly stage
     const specMat = new THREE.ShaderMaterial({
@@ -1095,8 +1121,8 @@
 
     // full-detail hull for the main view, a much lighter one for the shadow map, the
     // planar reflection and the refraction pass (which are small, blurred or both)
-    const duckGeo = buildDuckGeometry(Q.duck[0]);
-    const duckGeoLo = buildDuckGeometry(Q.duck[1]);
+    let duckGeo = buildDuckGeometry(Q.duck[0]);
+    let duckGeoLo = buildDuckGeometry(Q.duck[1]);
     const eyeGeo = buildEyeGeometry();
 
     const vinyl = new THREE.MeshPhysicalMaterial({
@@ -1285,11 +1311,21 @@
     //  it bobs, so rings genuinely leave the hull, spread, interfere with the
     //  neighbours' rings, bend around other ducks and fade out.
     // ------------------------------------------------------------------
-    const RIP_N = Q.rip, RIP_L = 236;
+    const RIP_L = 236;
     const RIP_GAIN = params.has('rings') ? parseFloat(params.get('rings')) : 1.0;
-    const mkRip = () => new THREE.WebGLRenderTarget(RIP_N, RIP_N, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
-    let ripA = mkRip(), ripB = mkRip();
-    const ripOut = new THREE.WebGLRenderTarget(RIP_N, RIP_N, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, anisotropy: maxAniso });
+    let ripA = null, ripB = null, ripOut = null;
+    function buildRipples() {
+      for (const r of [ripA, ripB, ripOut]) if (r) r.dispose();
+      const mk = () => new THREE.WebGLRenderTarget(Q.rip, Q.rip, { type: floatRT ? THREE.FloatType : THREE.HalfFloatType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: false });
+      ripA = mk(); ripB = mk();
+      ripOut = new THREE.WebGLRenderTarget(Q.rip, Q.rip, { type: THREE.HalfFloatType, depthBuffer: false, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, anisotropy: aniso() });
+      // a new target is not guaranteed to start cleared, and the simulation feeds on itself
+      renderer.setClearColor(0x000000, 0);
+      for (const r of [ripA, ripB, ripOut]) { renderer.setRenderTarget(r); renderer.clear(true, false, false); }
+      renderer.setClearColor(0x000000, 1);
+      renderer.setRenderTarget(null);
+    }
+    buildRipples();
     const duckA = Array.from({ length: DUCKS }, () => new THREE.Vector4());   // x, z, yaw, scale
     const duckB = Array.from({ length: DUCKS }, () => new THREE.Vector4());   // ring drive, -, vx, vz
     const RIP_COMMON = /* glsl */`
@@ -1298,8 +1334,8 @@
       uniform sampler2D tPrev;
       uniform vec4 uDuckA[DUCKS];
       uniform vec4 uDuckB[DUCKS];
-      const float RN = ${RIP_N}.0, RL = ${RIP_L}.0, DX = RL / RN;
-      float H(ivec2 p) { return texelFetch(tPrev, clamp(p, ivec2(0), ivec2(${RIP_N - 1})), 0).x; }
+      const float RL = ${RIP_L}.0;
+      float H(ivec2 p) { return texelFetch(tPrev, clamp(p, ivec2(0), textureSize(tPrev, 0) - 1), 0).x; }
       // signed distance (roughly, in world units) from a duck's waterline
       float hullEdge(vec2 rel, vec4 d) {
         float c = cos(d.z), s = sin(d.z);
@@ -1313,6 +1349,7 @@
         uniform float uDt;
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy);
+          float RN = float(textureSize(tPrev, 0).x), DX = RL / RN;
           vec2 s = texelFetch(tPrev, p, 0).xy;                    // height, vertical velocity
           float lap = (H(p + ivec2(1, 0)) + H(p - ivec2(1, 0)) + H(p + ivec2(0, 1)) + H(p - ivec2(0, 1)) - 4.0 * s.x) / (DX * DX);
           vec2 xz = (gl_FragCoord.xy / RN - 0.5) * RL;
@@ -1345,6 +1382,7 @@
       fragmentShader: RIP_COMMON + /* glsl */`
         void main() {
           ivec2 p = ivec2(gl_FragCoord.xy);
+          float RN = float(textureSize(tPrev, 0).x), DX = RL / RN;
           vec2 slope = vec2(H(p + ivec2(1, 0)) - H(p - ivec2(1, 0)), H(p + ivec2(0, 1)) - H(p - ivec2(0, 1))) / (2.0 * DX);
           vec2 xz = (gl_FragCoord.xy / RN - 0.5) * RL;
           float contact = 0.0;
@@ -1377,7 +1415,7 @@
       // only the long swell displaces vertices (shortest wavelength ~74 units), so the grid can be coarse
       for (let r = 0; r <= 460; r += 5) rings.push(r);
       let r = 460; while (r < 42000) { r *= 1.06; rings.push(Math.min(r, 42000)); }
-      const ANG = TIER === 0 ? 192 : 256;
+      const ANG = 256;
       const pos = [], ind = [];
       for (let i = 0; i < rings.length; i++) for (let a = 0; a < ANG; a++) {
         const th = a / ANG * Math.PI * 2; pos.push(Math.cos(th) * rings[i], 0, Math.sin(th) * rings[i]);
@@ -1624,12 +1662,13 @@
     // 2. bokeh gather; alpha returns the blur radius that actually reached this pixel, so
     //    out-of-focus foreground can spill over sharp background in the composite
     const dofMat = new THREE.ShaderMaterial({
-      uniforms: { tHalf: { value: null }, uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 }, uRes: { value: new THREE.Vector2() } },
+      uniforms: { tHalf: { value: null }, uTaps: { value: Q.dof }, uFocus: { value: 100 }, uAperture: { value: 3.0 }, uMaxCoc: { value: 7.0 }, uRes: { value: new THREE.Vector2() } },
       vertexShader: fsVS,
       fragmentShader: /* glsl */`
         varying vec2 vUv;
         uniform sampler2D tHalf;
         uniform float uFocus, uAperture, uMaxCoc;
+        uniform int uTaps;
         uniform vec2 uRes;
         float coc(float z) { return min(uAperture * abs(z - uFocus) / max(z, 1e-3), uMaxCoc); }
         void main() {
@@ -1637,10 +1676,9 @@
           float zc = c0.a, cc = coc(zc);
           vec3 acc = c0.rgb;
           float wsum = 1.0, csum = cc;
-          const int N = ${Q.dof};
-          for (int i = 0; i < N; i++) {
+          for (int i = 0; i < uTaps; i++) {
             float fi = float(i) + 0.5;
-            float r = sqrt(fi / float(N)) * uMaxCoc;
+            float r = sqrt(fi / float(uTaps)) * uMaxCoc;
             float th = fi * 2.39996323;
             vec4 s = texture(tHalf, vUv + vec2(cos(th), sin(th)) * r / uRes);
             float cs = coc(s.a);
@@ -1908,9 +1946,11 @@
     const shake = (t, s) => Math.sin(t * 0.71 + s) * 0.5 + Math.sin(t * 1.37 + s * 2.1) * 0.3 + Math.sin(t * 2.93 + s * 3.7) * 0.2;
 
     // ------------------------------------------------------------------
-    //  Frame-time governor. GPU time comes from a timer query where the
-    //  browser offers one; otherwise from the frame interval, with an
-    //  occasional careful probe back up the ladder.
+    //  Frame-time governor. The frame interval alone cannot show headroom
+    //  (it sits at the display's refresh however fast the GPU is), so the
+    //  governor works from the frame generation time: a GPU timer query
+    //  where the browser offers one, otherwise a frame timed end to end
+    //  with a blocking read-back every few seconds.
     // ------------------------------------------------------------------
     const tqExt = (adaptive || params.has('hud')) ? gl.getExtension('EXT_disjoint_timer_query_webgl2') : null;
     let tq = null, gpuMs = 0, gpuSamples = 0;
@@ -1933,12 +1973,26 @@
         gl.deleteQuery(q);
       }
     }
+    // timed frames (no timer query): the first blocking read drains whatever is still queued,
+    // the second one is the measurement
+    const GEN_EVERY = 4000, _px = new Uint8Array(4);
+    // blocks until everything submitted so far has really been drawn. (three.js leaves a pixel-pack
+    // buffer bound while an asynchronous read is pending, which would turn this into a silent no-op.)
+    function waitForGpu() {
+      const pack = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+      if (pack) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, _px);
+      if (pack) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pack);
+    }
+    let genPhase = 0, genAt = 0;
+    const genReady = () => gpuSamples >= (tqExt ? 9 : 2);
     const gov = { frames: 0, acc: 0, spikes: 0, hold: 3, probeAt: Infinity, probeDelay: 20, probing: 0, before: 0, noGain: 0, lastGood: 0, locked: false, avg: 0 };
     function setLevel(n, now) {
       level = THREE.MathUtils.clamp(n, 0, LADDER.length - 1);
-      renderScale = LADDER[level].scale; msaa = LADDER[level].msaa;
+      renderScale = LADDER[level].scale; msaa = msaaFor(level);
       resize();
       gov.hold = now + 1.5; gov.frames = 0; gov.acc = 0; gpuMs = 0; gpuSamples = 0;
+      genPhase = 0; genAt = performance.now() + 1500;
     }
     function govern(rawDt) {
       const now = performance.now() / 1000;
@@ -1952,15 +2006,17 @@
       if (gov.acc < 1.0 || (gov.frames < 10 && gov.acc < 2.5)) return;
       const avg = gov.avg = gov.acc / gov.frames * 1000;
       gov.frames = 0; gov.acc = 0;
-      const timed = gpuSamples > 8;
-      const slow = timed ? (gpuMs > 15 || avg > 25) : avg > 21.5;
+      const timed = genReady();
+      // with a measurement in hand, slow frames that are cheap to generate are someone else's
+      // doing (a capped frame rate, a busy main thread) and lowering quality would not help
+      const slow = timed ? (gpuMs > 15 || (avg > 25 && gpuMs > 10)) : avg > 21.5;
       const fast = timed && gpuMs < 8.5 && avg < 19.5;
       // stepping down that buys nothing means the frame rate is capped elsewhere (battery saver,
       // a 30 Hz display, a busy main thread): give the quality back and stop chasing it
       if (gov.before) {
         if (avg > gov.before * 0.93) gov.noGain++; else { gov.noGain = 0; gov.lastGood = level; }
         gov.before = 0;
-        if (gov.noGain >= 2 && !timed) { gov.locked = true; setLevel(gov.lastGood, now); return; }
+        if (gov.noGain >= 2) { gov.locked = true; setLevel(gov.lastGood, now); return; }
       }
       if (slow && !gov.locked && level < LADDER.length - 1) {
         if (now < gov.probing) gov.probeDelay = Math.min(gov.probeDelay * 2, 300);   // the last probe was too optimistic
@@ -1985,12 +2041,14 @@
     // ------------------------------------------------------------------
     const clock = new THREE.Clock();
     const ENV_PERIOD = 1.5;
-    let simTime = 0, lastEnv = 0, focus = 100, started = false;
+    let simTime = 0, lastEnv = 0, focus = 100, started = false, live = false;
     const _sp = new THREE.Vector3();
 
     function frame(fixedDt) {
-      if (!CAPTURE) requestAnimationFrame(frame);
-      const rawDt = CAPTURE ? fixedDt : clock.getDelta();
+      if (live) requestAnimationFrame(frame);
+      const rawDt = live ? clock.getDelta() : fixedDt;
+      const t0 = performance.now();
+      if (live && adaptive && !tqExt && genPhase === 0 && t0 > genAt) genPhase = 2;
       const dt = Math.min(rawDt, 0.1);
       simTime += dt; frameNo++;
       const t = simTime, tLoop = t % LOOP;
@@ -2109,13 +2167,21 @@
       cu.uRes.value.copy(size);
       blit(compMat, null);
       if (tqExt) gpuEnd();
+      if (genPhase > 0) {
+        waitForGpu();
+        if (--genPhase === 0) {
+          const ms = performance.now() - t0;
+          gpuMs = gpuSamples ? gpuMs * 0.6 + ms * 0.4 : ms; gpuSamples++;
+          genAt = performance.now() + GEN_EVERY;
+        }
+      }
 
-      if (!started) { started = true; requestAnimationFrame(() => document.getElementById('curtain').classList.add('gone')); }
-      if (adaptive) govern(rawDt);
+      if ((live || CAPTURE) && !started) { started = true; requestAnimationFrame(() => document.getElementById('curtain').classList.add('gone')); }
+      if (live && adaptive) govern(rawDt);
       if (hud && t - hudAt > 0.5) {
         hudAt = t;
         hud.textContent = `${gpuName.replace(/^ANGLE \(|\)$/g, '').slice(0, 70)}\ntier ${['low', 'med', 'high'][TIER]}  level ${level}/${LADDER.length - 1}${gov.locked ? ' (locked)' : ''}  ${size.x}x${size.y}  msaa ${msaa}\n` +
-          `frame ${(gov.avg || rawDt * 1000).toFixed(1)} ms  gpu ${gpuSamples ? gpuMs.toFixed(1) + ' ms' : 'n/a'}  sun ${THREE.MathUtils.radToDeg(SUN_ELEV).toFixed(1)}°  vis ${sunVis.toFixed(2)}`;
+          `frame ${(gov.avg || rawDt * 1000).toFixed(1)} ms  ${tqExt ? 'gpu' : 'gen'} ${gpuSamples ? gpuMs.toFixed(1) + ' ms' : 'n/a'}${bootNote}  sun ${THREE.MathUtils.radToDeg(SUN_ELEV).toFixed(1)}°  vis ${sunVis.toFixed(2)}`;
       }
     }
 
@@ -2133,6 +2199,69 @@
     //  Boot: everything heavy is spread over a few frames behind the curtain,
     //  so even a slow GPU never sees one giant job
     // ------------------------------------------------------------------
+    // rebuild everything a tier decides. Only ever called behind the curtain.
+    function setTier(n) {
+      TIER = n; Q = TIERS[n];
+      renderer.shadowMap.type = Q.soft ? THREE.PCFSoftShadowMap : THREE.PCFShadowMap;
+      for (const m of [vinyl, paint, vinylLo, paintLo]) m.needsUpdate = true;
+      sunLight.shadow.mapSize.set(Q.shadow[0], Q.shadow[1]);
+      if (sunLight.shadow.map) { sunLight.shadow.map.dispose(); sunLight.shadow.map = null; }
+      buildWaveTargets();
+      waterMat.uniforms.tWave0.value = CASCADES[0].out.texture;
+      waterMat.uniforms.tWave1.value = CASCADES[1].out.texture;
+      waterMat.uniforms.tWave2.value = CASCADES[2].out.texture;
+      buildRipples();
+      waterMat.uniforms.tRipple.value = ripOut.texture;
+      buildCloudCube(); clearCloudCube();
+      buildEnvCube();
+      duckGeo.dispose(); duckGeoLo.dispose();
+      duckGeo = duckMesh.geometry = buildDuckGeometry(Q.duck[0]);
+      duckGeoLo = duckLo.geometry = buildDuckGeometry(Q.duck[1]);
+      cloudMat.uniforms.uSteps.value = Q.steps;
+      dofMat.uniforms.uTaps.value = Q.dof;
+      msaa = msaaFor(level);
+      resize();
+      refreshSky();
+    }
+    // frame generation time: hidden frames, each timed end to end with a blocking read-back.
+    // The first few are thrown away (they compile shaders); the median of the rest is the answer.
+    async function measureGen(n = 5, warm = 3) {
+      const ts = [];
+      for (let i = 0; i < n + warm; i++) {
+        const t0 = performance.now();
+        frame(1 / 60);
+        waitForGpu();
+        if (i >= warm) ts.push(performance.now() - t0);
+        await nextFrame();
+      }
+      ts.sort((a, b) => a - b);
+      return ts[ts.length >> 1];
+    }
+    // how much more a frame costs one tier up (more pixels, more samples, more cloud work)
+    const TIER_GROWTH = [1.7, 1.5];
+    let bootNote = '';
+    async function fitTier() {
+      const first = TIER;
+      let gen = await measureGen();
+      bootNote = `  (boot: ${['low', 'med', 'high'][first]} ${gen.toFixed(1)} ms`;
+      if (!tierPinned) {
+        // promote while the next tier is predicted to fit in about half a 60 Hz frame;
+        // drop one if this tier does not fit in a frame at all
+        let target = TIER, g = gen;
+        while (target < tierCap && g * TIER_GROWTH[target] < 9) { g *= TIER_GROWTH[target]; target++; }
+        if (target === TIER && gen > 18 && TIER > 0) target = TIER - 1;
+        if (target !== TIER) {
+          setTier(target);
+          gen = await measureGen();
+          // the prediction is only a prediction: if the new tier measures over budget, step back
+          while (gen > 14 && TIER > first) { setTier(TIER - 1); gen = await measureGen(); }
+          bootNote += ` -> ${['low', 'med', 'high'][TIER]} ${gen.toFixed(1)} ms`;
+        }
+        try { localStorage.setItem('realTier', JSON.stringify({ gpu: gpuName, tier: TIER })); } catch (err) { /* private mode */ }
+      }
+      bootNote += ')';
+      if (!tqExt) { gpuMs = gen; gpuSamples = 2; genAt = performance.now() + GEN_EVERY; }
+    }
     function refreshSky() {
       setSun(); updateLighting(); renderSkyLut();
       for (const tl of tiles) renderTile(tl);
@@ -2155,6 +2284,8 @@
           await Promise.race([renderer.compileAsync(scene, camera), new Promise(r => setTimeout(r, 4000))]);
         } catch (err) { /* compiled lazily instead */ }
         renderer.setRenderTarget(null);
+        if (adaptive) await fitTier();
+        live = true;
         clock.getDelta();
         frame();
       } else {
@@ -2163,9 +2294,11 @@
         window.__setPan = (a) => { autoPanAngle = a; };
         window.__view = (p, t) => { hasInteracted = true; camera.position.set(...p); controls.target.set(...t); };
         window.__setSun = (th) => { sunTheta = th; refreshSky(); };
+        window.__setTier = (n) => { setTier(n); return TIER; };
         window.__ducks = ducks; window.__controls = controls;
         window.__spin = (n, dt = 1 / 60) => { for (let i = 0; i < n; i++) { simTime += dt; updateDucks(simTime, dt); stepRipples(dt); } };
-        window.__dbg = { THREE, renderer, scene, camera, tiles, Q, TIER, gpuName, cubeRT, lutRT, ripOut, ripA: () => ripA, sceneRT: () => sceneRT, waterMat, cloudMat, skyDomeMat, compMat, sunDir, amb, sunE, refreshSky, duckGeo, duckGeoLo, eyeGeo, sunVis: () => sunVis };
+        window.__dbg = { THREE, renderer, scene, camera, gpuName, lutRT, waterMat, cloudMat, skyDomeMat, compMat, sunDir, amb, sunE, refreshSky, eyeGeo, sunVis: () => sunVis, sceneRT: () => sceneRT, ripA: () => ripA,
+          get tiles() { return tiles; }, get Q() { return Q; }, get TIER() { return TIER; }, get cubeRT() { return cubeRT; }, get ripOut() { return ripOut; }, get duckGeo() { return duckGeo; }, get duckGeoLo() { return duckGeoLo; } };
         window.__ready = true;
       }
     }
